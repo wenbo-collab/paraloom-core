@@ -419,6 +419,99 @@ fn print_banner() {
     );
 }
 
+/// Build the `validator withdraw-unbonded` transaction instructions.
+///
+/// When the validator's ATA for `stake_mint` does not exist yet, prepend a
+/// create-ATA instruction (funded by the validator, who also signs the
+/// transaction) so `WithdrawUnbondedStake` no longer aborts on-chain with
+/// `AccountNotInitialized` (3012). Otherwise the withdraw instruction alone
+/// is returned unchanged (#1323).
+#[cfg(feature = "solana-bridge")]
+fn withdraw_unbonded_instructions(
+    program_id: &Pubkey,
+    validator: &Pubkey,
+    stake_mint: &Pubkey,
+    validator_token: &Pubkey,
+    token_program: &Pubkey,
+    ata_exists: bool,
+) -> Vec<solana_sdk::instruction::Instruction> {
+    let mut instructions = Vec::new();
+    if !ata_exists {
+        instructions.push(
+            spl_associated_token_account::instruction::create_associated_token_account(
+                validator,
+                validator,
+                stake_mint,
+                token_program,
+            ),
+        );
+    }
+    instructions.push(create_withdraw_unbonded_stake_instruction(
+        program_id,
+        validator,
+        stake_mint,
+        validator_token,
+        token_program,
+    ));
+    instructions
+}
+
+#[cfg(all(test, feature = "solana-bridge"))]
+mod withdraw_unbonded_tests {
+    use super::*;
+
+    fn fixtures() -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey) {
+        (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        )
+    }
+
+    #[test]
+    fn missing_ata_prepends_create_instruction() {
+        let (program_id, validator, stake_mint, _, token_program) = fixtures();
+        // The CLI derives this ATA itself, so derive it the same way here:
+        // the create-ATA instruction must target exactly this address.
+        let validator_token = derive_associated_token_address(
+            &validator,
+            &stake_mint,
+            &token_program,
+        );
+        let ixs = withdraw_unbonded_instructions(
+            &program_id,
+            &validator,
+            &stake_mint,
+            &validator_token,
+            &token_program,
+            false,
+        );
+        assert_eq!(ixs.len(), 2);
+        assert_eq!(ixs[0].program_id, spl_associated_token_account::id());
+        // Create-ATA accounts: payer, ATA, owner, mint, system, token program.
+        assert_eq!(ixs[0].accounts[1].pubkey, validator_token);
+        assert_eq!(ixs[1].program_id, program_id);
+        assert_eq!(ixs[1].accounts[3].pubkey, validator_token);
+    }
+
+    #[test]
+    fn existing_ata_sends_withdraw_only() {
+        let (program_id, validator, stake_mint, validator_token, token_program) = fixtures();
+        let ixs = withdraw_unbonded_instructions(
+            &program_id,
+            &validator,
+            &stake_mint,
+            &validator_token,
+            &token_program,
+            true,
+        );
+        assert_eq!(ixs.len(), 1);
+        assert_eq!(ixs[0].program_id, program_id);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1699,19 +1792,33 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
-                let ix = create_withdraw_unbonded_stake_instruction(
+                // WithdrawUnbondedStake requires an initialized token
+                // account: Anchor aborts with AccountNotInitialized (3012)
+                // when the validator has never held stake_mint tokens, which
+                // leaves unbonded SOL locked on the program-owned PDA with
+                // no exit path. Preflight the ATA and create it in the same
+                // transaction when it does not exist yet (#1323).
+                let ata_exists = client.get_account(&validator_token).is_ok();
+                if !ata_exists {
+                    println!(
+                        "Validator ATA {} not found; creating it in this transaction...",
+                        validator_token
+                    );
+                }
+                let instructions = withdraw_unbonded_instructions(
                     &program_id,
                     &validator.pubkey(),
                     &stake_mint,
                     &validator_token,
                     &token_program,
+                    ata_exists,
                 );
 
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &instructions,
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
