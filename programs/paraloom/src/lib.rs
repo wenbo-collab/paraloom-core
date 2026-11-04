@@ -624,6 +624,44 @@ pub mod paraloom_program {
 
         let mut fee = 0u64;
         if ext_amount < 0 {
+            // (#1337) The accounts struct leaves the payout and fee token
+            // accounts unchecked so internal transfers survive Anchor
+            // validation; re-impose the equivalent constraints here, where
+            // tokens actually move. The accounts are unpacked from raw data
+            // rather than via `InterfaceAccount::try_from`, which needs a
+            // `'info`-lived reference the handler cannot manufacture; the
+            // base token-account layout is identical for classic SPL and
+            // Token-2022, and the owner must match the `token_program` the
+            // CPI below runs against.
+            // Each borrow is scoped to its own block: the `Ref` must be
+            // dropped before the `transfer_checked` CPIs below borrow the
+            // same accounts, or the runtime fails with `AccountBorrowFailed`.
+            {
+                let recipient_data =
+                    ctx.accounts.recipient_token_account.try_borrow_data()?;
+                let mut recipient_slice: &[u8] = &recipient_data;
+                let recipient_ta =
+                    TokenAccount::try_deserialize_unchecked(&mut recipient_slice)?;
+                require!(
+                    recipient_ta.mint == ctx.accounts.mint.key()
+                        && *ctx.accounts.recipient_token_account.owner
+                            == ctx.accounts.token_program.key(),
+                    BridgeError::InvalidTokenAccount
+                );
+            }
+            {
+                let fee_data = ctx.accounts.fee_token_account.try_borrow_data()?;
+                let mut fee_slice: &[u8] = &fee_data;
+                let fee_ta = TokenAccount::try_deserialize_unchecked(&mut fee_slice)?;
+                require!(
+                    fee_ta.mint == ctx.accounts.mint.key()
+                        && fee_ta.owner == ctx.accounts.authority.key()
+                        && *ctx.accounts.fee_token_account.owner
+                            == ctx.accounts.token_program.key(),
+                    BridgeError::InvalidTokenAccount
+                );
+            }
+
             let gross = ext_amount.unsigned_abs();
             fee = gross
                 .checked_mul(WITHDRAWAL_FEE_BPS)
@@ -1891,10 +1929,11 @@ pub struct TransactSpl<'info> {
 
     /// The mint being withdrawn; its bytes are the proof's `asset` public input.
     ///
-    /// Boxed (like the token accounts below) to keep the `TransactSpl` context
-    /// off the BPF stack: unboxed, the four extra InterfaceAccounts push the
-    /// generated `try_accounts` frame past the 4 KB limit and settlement fails
-    /// on-chain with a stack access violation (#779).
+    /// Boxed to keep the `TransactSpl` context off the BPF stack: unboxed,
+    /// the extra InterfaceAccounts push the generated `try_accounts` frame
+    /// past the 4 KB limit and settlement fails on-chain with a stack access
+    /// violation (#779). The payout/fee accounts below are `UncheckedAccount`
+    /// (plain references), so they need no boxing.
     pub mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// Per-mint token vault the payout leaves from.
@@ -1914,13 +1953,36 @@ pub struct TransactSpl<'info> {
 
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
-    #[account(mut, token::mint = mint)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    ///
+    /// Deliberately unchecked (#1337): for internal transfers
+    /// (`ext_amount == 0`) the wallet passes `Pubkey::default()` (the System
+    /// program) as the recipient and no token moves, so Anchor's
+    /// `token::mint` deserialization aborted every shielded SPL transfer with
+    /// `AccountOwnedByWrongProgram` before the handler ever ran. The handler
+    /// re-imposes the exact `TokenAccount`-for-`mint` check on the withdrawal
+    /// path (`ext_amount < 0`), where a payout actually leaves the vault.
+    /// CHECK: validated in the handler on the withdrawal path only.
+    /// Unboxed on purpose: unlike `InterfaceAccount`, `UncheckedAccount` is
+    /// just a reference, so it does not cost BPF stack — and Anchor's
+    /// `Accounts` derive rejects `Box<UncheckedAccount>` with a composite
+    /// constraint panic.
+    #[account(mut)]
+    pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid.
+    ///
+    /// Deliberately unchecked (#1337): the settling validator may not have
+    /// pre-initialized an ATA for this `mint`, and on internal transfers
+    /// (`ext_amount == 0`) no fee moves at all, so Anchor's
+    /// `token::authority` deserialization aborted every shielded SPL transfer
+    /// with `AccountNotInitialized`. The handler re-imposes the
+    /// `TokenAccount`-for-`mint`-owned-by-`authority` check on the withdrawal
+    /// path, where the fee is actually paid.
+    /// CHECK: validated in the handler on the withdrawal path only.
+    /// Unboxed, same as `recipient_token_account` above.
+    #[account(mut)]
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
@@ -2916,4 +2978,7 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    #[msg("Token account is not a valid payout/fee account for this mint and authority (#1337)")]
+    InvalidTokenAccount,
 }

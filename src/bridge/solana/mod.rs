@@ -102,6 +102,14 @@ impl SolanaBridge {
         self.program.latest_blockhash().await
     }
 
+    /// The token program that owns `mint` (#1337), for the co-sign payload.
+    pub async fn mint_token_program(
+        &self,
+        mint: &solana_sdk::pubkey::Pubkey,
+    ) -> Result<solana_sdk::pubkey::Pubkey> {
+        self.program.mint_token_program(mint).await
+    }
+
     /// Current slot, for deriving a settlement's expiration window.
     pub async fn current_slot(&self) -> Result<u64> {
         self.program.get_slot().await

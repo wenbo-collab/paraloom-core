@@ -215,6 +215,26 @@ impl ProgramInterface {
         Ok(self.rpc.get_latest_blockhash().await?.to_bytes())
     }
 
+    /// The token program that owns `mint` (#1337): classic SPL Token or
+    /// Token-2022. The settlement leader reads this over RPC so the co-sign
+    /// payload carries the right program for the fee ATA derivation; anything
+    /// else (a non-mint account, an unknown owner) is a hard error rather
+    /// than a silently wrong ATA.
+    pub async fn mint_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        use crate::bridge::solana::instructions::{
+            SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+        };
+        let account = self.rpc.get_account(mint).await?;
+        let owner = account.owner;
+        if owner == SPL_TOKEN_PROGRAM_ID || owner == SPL_TOKEN_2022_PROGRAM_ID {
+            Ok(owner)
+        } else {
+            Err(BridgeError::ConfigError(format!(
+                "mint {mint} is owned by {owner}, not a known token program"
+            )))
+        }
+    }
+
     /// Submit a transaction the caller already assembled and signed — the
     /// co-signed settlement multi-sig tx (#260) — and confirm it on-chain.
     pub async fn submit_signed_transaction(&self, transaction: &Transaction) -> Result<String> {

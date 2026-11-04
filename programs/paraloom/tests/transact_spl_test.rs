@@ -16,14 +16,14 @@ use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::merkle_tree::{IncrementalMerkleTree, TREE_DEPTH, ZERO_HASHES};
 use paraloom_program::transact_spl_fixture_data as fx;
-use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
-use solana_program_test::{tokio, ProgramTest};
+use paraloom_program::{accounts, instruction, BridgeError, BridgeState, NullifierAccount};
+use solana_program_test::{tokio, BanksClientError, ProgramTest};
 use solana_sdk::{
     account::Account,
-    instruction::{AccountMeta, Instruction},
+    instruction::{AccountMeta, Instruction, InstructionError},
     signature::{Keypair, Signer},
     system_program,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
 
 mod common;
@@ -467,4 +467,258 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let state_raw = banks.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+}
+
+/// #1337 regression: an internal shielded SPL transfer (`ext_amount == 0`)
+/// must survive Anchor account validation even though the wallet passes the
+/// System program as the recipient token account and the settling validator
+/// has no ATA for the mint. Before the fix this aborted in deserialization
+/// (`AccountOwnedByWrongProgram` / `AccountNotInitialized`) and no shielded
+/// SPL transfer could ever land.
+///
+/// No deposit is needed: the empty-tree root is a known root, and the
+/// fixture proof — bound to a withdrawal's recipient and amount — is
+/// deliberately reused so the transaction reaches the verifier and fails
+/// there with `InvalidProof`. Reaching the handler at all is the assertion:
+/// the failure must be the proof check, not account validation.
+#[tokio::test]
+async fn transact_spl_internal_transfer_passes_account_validation() {
+    let program_id = paraloom_program::ID;
+    let mut pt = program_test(program_id);
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let authority_token = add_token_account(
+        &mut pt,
+        stake_mint,
+        upgrade_authority.pubkey(),
+        TEST_TOKEN_FUND,
+    );
+    let cosigner = Keypair::new();
+    pt.add_account(
+        cosigner.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let cosigner_token = add_token_account(&mut pt, stake_mint, cosigner.pubkey(), TEST_TOKEN_FUND);
+
+    let asset_mint = Pubkey::new_from_array(fx::SPL_FIXTURE_MINT);
+    bake_mint_at(&mut pt, asset_mint);
+
+    let (mut banks, _payer, blockhash) = pt.start().await;
+
+    let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) = Pubkey::find_program_address(
+        &[b"validator", upgrade_authority.pubkey().as_ref()],
+        &program_id,
+    );
+    let (cosigner_pda, _) =
+        Pubkey::find_program_address(&[b"validator", cosigner.pubkey().as_ref()], &program_id);
+    let (asset_vault, _) =
+        Pubkey::find_program_address(&[b"asset_vault", asset_mint.as_ref()], &program_id);
+    let (asset_vault_authority, _) =
+        Pubkey::find_program_address(&[b"asset_vault_authority"], &program_id);
+    let (asset_config, _) =
+        Pubkey::find_program_address(&[b"asset_config", asset_mint.as_ref()], &program_id);
+    let (nf0_pda, _) =
+        Pubkey::find_program_address(&[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_0.as_ref()], &program_id);
+    let (nf1_pda, _) =
+        Pubkey::find_program_address(&[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_1.as_ref()], &program_id);
+
+    send(
+        &mut banks,
+        blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::Initialize {
+                program_version: 1,
+                initial_merkle_root: [0u8; 32],
+            }
+            .data(),
+            accounts: accounts::Initialize {
+                bridge_state: state_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+    send(
+        &mut banks,
+        blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeMerkleTree {}.data(),
+            accounts: accounts::InitializeMerkleTree {
+                merkle_tree: tree_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+    send(
+        &mut banks,
+        blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                stake_mint,
+                stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                stake_vault_authority: Pubkey::find_program_address(
+                    &[b"stake_vault_authority"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
+                rent: solana_sdk::sysvar::rent::ID,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+    send(
+        &mut banks,
+        blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitAssetVault {}.data(),
+            accounts: accounts::InitAssetVault {
+                authority: upgrade_authority.pubkey(),
+                mint: asset_mint,
+                asset_vault,
+                asset_vault_authority,
+                asset_config,
+                program_data: program_data_pda,
+                token_program: spl_token::id(),
+                system_program: system_program::ID,
+                rent: solana_sdk::sysvar::rent::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+    for (validator, token_account) in [
+        (&upgrade_authority, authority_token),
+        (&cosigner, cosigner_token),
+    ] {
+        let validator_pda = Pubkey::find_program_address(
+            &[b"validator", validator.pubkey().as_ref()],
+            &program_id,
+        )
+        .0;
+        send(
+            &mut banks,
+            blockhash,
+            validator,
+            Instruction {
+                program_id,
+                data: instruction::RegisterValidator {
+                    token_stake_amount: paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE,
+                    stake_amount: MIN_VALIDATOR_STAKE,
+                }
+                .data(),
+                accounts: accounts::RegisterValidator {
+                    stake_mint,
+                    validator_account: validator_pda,
+                    validator_token_account: token_account,
+                    stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                    token_program: spl_token::id(),
+                    validator_registry: registry_pda,
+                    validator: validator.pubkey(),
+                    system_program: system_program::ID,
+                }
+                .to_account_metas(None),
+            },
+        )
+        .await;
+    }
+
+    // Internal transfer: recipient is the System program (what the wallet
+    // passes for `ext_amount == 0`) and the fee account does not exist at all.
+    let transact_ix = Instruction {
+        program_id,
+        data: instruction::TransactSpl {
+            nullifiers: [fx::SPL_FIXTURE_NULLIFIER_0, fx::SPL_FIXTURE_NULLIFIER_1],
+            output_commitments: [fx::SPL_FIXTURE_COMMITMENT_0, fx::SPL_FIXTURE_COMMITMENT_1],
+            root: ZERO_HASHES[TREE_DEPTH],
+            ext_amount: 0,
+            proof: {
+                let mut p = Vec::new();
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_A);
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_B);
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_C);
+                p
+            },
+        }
+        .data(),
+        accounts: {
+            let mut metas = accounts::TransactSpl {
+                bridge_state: state_pda,
+                merkle_tree: tree_pda,
+                mint: asset_mint,
+                asset_vault,
+                asset_vault_authority,
+                recipient_token_account: Pubkey::new_unique(),
+                fee_token_account: Pubkey::new_unique(),
+                nullifier_account_0: nf0_pda,
+                nullifier_account_1: nf1_pda,
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                token_program: spl_token::id(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None);
+            metas.push(AccountMeta::new_readonly(cosigner.pubkey(), true));
+            metas.push(AccountMeta::new_readonly(cosigner_pda, false));
+            metas
+        },
+    };
+    let transact_tx = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            transact_ix,
+        ],
+        Some(&upgrade_authority.pubkey()),
+        &[&upgrade_authority, &cosigner],
+        blockhash,
+    );
+    let result = banks.process_transaction(transact_tx).await;
+    let code = match result.expect_err("mismatched fixture proof must fail") {
+        BanksClientError::TransactionError(e) => e,
+        BanksClientError::SimulationError { err, .. } => err,
+        other => panic!("expected a transaction error, got {other:?}"),
+    };
+    let code = match code {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => code,
+        other => panic!("expected a custom instruction error, got {other:?}"),
+    };
+    assert_eq!(
+        code,
+        BridgeError::InvalidProof as u32 + anchor_lang::error::ERROR_CODE_OFFSET,
+        "internal transfer must reach the proof check (InvalidProof for the \
+         mismatched fixture proof), not die in Anchor account validation as \
+         it did before #1337 (AccountOwnedByWrongProgram / AccountNotInitialized)"
+    );
 }

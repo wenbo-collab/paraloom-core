@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::bridge::solana::{
     build_settlement_message, derive_bridge_vault, CoSignPayload, SettlementParams,
+    SPL_TOKEN_PROGRAM_ID,
 };
 use crate::bridge::Bridge;
 use crate::compute::{ComputeAuthPolicy, JobCoordinator, JobExecutor, JobManager};
@@ -2452,12 +2453,31 @@ impl Node {
                     .map_err(|e| anyhow!("transact proof: {e}"))?
             }
         };
+        // (#1337) Resolve the mint's owning token program over RPC so the
+        // fee ATA in the co-signed message derives under Token-2022 for
+        // Token-2022 mints. Without a bridge there is no RPC to ask, so fall
+        // back to the classic SPL Token program — the pre-#1337 behaviour —
+        // rather than refusing a settlement this node cannot check on-chain.
+        let token_program = match request.mint {
+            Some(mint) => match &self.bridge {
+                Some(bridge) => bridge
+                    .lock()
+                    .await
+                    .mint_token_program(&Pubkey::new_from_array(mint))
+                    .await
+                    .map(|pk| pk.to_bytes())
+                    .unwrap_or_else(|_| SPL_TOKEN_PROGRAM_ID.to_bytes()),
+                None => SPL_TOKEN_PROGRAM_ID.to_bytes(),
+            },
+            None => SPL_TOKEN_PROGRAM_ID.to_bytes(),
+        };
         // SPL settlement (#779) takes the transact_spl path; `recipient` is the
         // recipient token account and the vault is the mint's asset vault.
         let params = match request.mint {
             Some(mint) => SettlementParams::TransactSpl {
                 recipient_token_account: request.recipient,
                 mint,
+                token_program,
                 nullifiers: request.nullifiers,
                 output_commitments: request.output_commitments,
                 root: request.root,

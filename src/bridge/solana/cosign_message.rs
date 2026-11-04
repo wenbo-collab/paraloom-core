@@ -56,9 +56,13 @@ pub enum SettlementParams {
     /// recipient **token account**. The settling validator's fee token account
     /// is derived from the payload `authority` + `mint` (its ATA), so every
     /// co-signer builds the same instruction without an extra field.
+    /// `token_program` is the program that owns `mint` (#1337): the leader
+    /// resolves it from the mint account over RPC, so Token-2022 mints derive
+    /// their ATA under Token-2022 instead of the classic SPL Token program.
     TransactSpl {
         recipient_token_account: [u8; 32],
         mint: [u8; 32],
+        token_program: [u8; 32],
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
@@ -190,6 +194,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         SettlementParams::TransactSpl {
             recipient_token_account,
             mint,
+            token_program,
             nullifiers,
             output_commitments,
             root,
@@ -200,10 +205,14 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
             // The settling validator's fee lands in its own ATA for the mint,
             // derived deterministically so every co-signer builds the same ix.
+            // The token program comes from the payload (#1337): deriving under
+            // the wrong program yields an address no account lives at, which
+            // is exactly how Token-2022 withdrawals used to fail.
+            let token_program_pk = Pubkey::new_from_array(*token_program);
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +220,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
@@ -309,6 +318,47 @@ mod tests {
             validator_message.serialize(),
             "a validator rebuilding from the transported payload must match the leader's message"
         );
+    }
+
+    #[test]
+    fn transact_spl_uses_payload_token_program_for_fee_ata() {
+        // #1337: a Token-2022 mint's fee ATA must derive under Token-2022,
+        // not the classic SPL Token program the builder used to hardcode.
+        use crate::bridge::solana::{
+            derive_associated_token_address, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+        };
+        for (program, label) in [
+            (SPL_TOKEN_2022_PROGRAM_ID, "Token-2022"),
+            (SPL_TOKEN_PROGRAM_ID, "classic SPL"),
+        ] {
+            let mut payload = sample_transact_payload();
+            payload.params = SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [7u8; 32],
+                token_program: program.to_bytes(),
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: 0,
+                proof: vec![0u8; 256],
+            };
+            let msg = build_settlement_message(&payload).expect("build");
+            // instructions[0] is the compute-budget prepend; [1] is transact_spl.
+            let ix = &msg.instructions[1];
+            let authority = Pubkey::new_from_array([2u8; 32]);
+            let mint = Pubkey::new_from_array([7u8; 32]);
+            let fee = msg.account_keys[ix.accounts[6] as usize];
+            assert_eq!(
+                fee,
+                derive_associated_token_address(&authority, &mint, &program),
+                "{label} fee ATA must derive under the payload token program"
+            );
+            let token_program_key = msg.account_keys[ix.accounts[12] as usize];
+            assert_eq!(
+                token_program_key, program,
+                "{label} token program account must match the payload"
+            );
+        }
     }
 
     #[test]
