@@ -24,6 +24,13 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
 
 /// Convert a hex string to bytes
 pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, &'static str> {
+    // `hex.len()` counts UTF-8 bytes and `&hex[i..i + 2]` slices at 2-byte
+    // offsets, so a non-ASCII string whose codepoints straddle a boundary
+    // (e.g. "a€", 1 + 3 = 4 bytes) panics at `&hex[0..2]` instead of
+    // returning Err. Hex is ASCII-only, so reject non-ASCII up front.
+    if !hex.is_ascii() {
+        return Err("Invalid hex character");
+    }
     if !hex.len().is_multiple_of(2) {
         return Err("Hex string must have an even number of characters");
     }
@@ -35,4 +42,33 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, &'static str> {
     }
 
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_to_bytes_accepts_valid_hex() {
+        assert_eq!(hex_to_bytes("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
+        assert_eq!(hex_to_bytes("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_odd_length() {
+        assert!(hex_to_bytes("abc").is_err());
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_invalid_chars() {
+        assert!(hex_to_bytes("zz").is_err());
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_non_ascii_without_panicking() {
+        // "a€" is 4 bytes (even length) with a codepoint straddling the
+        // 2-byte slice boundary — previously panicked, must now Err.
+        assert!(hex_to_bytes("a€").is_err());
+        assert!(hex_to_bytes("€€").is_err());
+    }
 }

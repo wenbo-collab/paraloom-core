@@ -47,7 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program_id = Pubkey::from_str(&std::env::var("SOLANA_PROGRAM_ID")?)?;
     let payer = load_keypair_from_file(&std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?)?;
     let ingress = std::env::var("TRANSACT_INGRESS_URL")
-        .unwrap_or_else(|_| "https://node.paraloom.io".to_string());
+        .unwrap_or_else(|_| "https://node.paraloom.io".to_string())
+        .trim_end_matches('/')
+        .to_string();
 
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
     let (vault_pda, _) = derive_bridge_vault(&program_id);
@@ -73,9 +75,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("      deposit sig: {sig}");
 
     // ── 2. read the tree: our leaf index + the post-deposit root ────────────
+    // Layout: disc(8) + next_index(8) + root_index(8) + root(32) = 56, then
+    // filled_subtrees[32][32] out to byte 56 + TX_LEVELS * 32. Guard the
+    // length before slicing: a short/truncated account must Err, not panic.
     let raw = client.get_account_data(&tree_pda)?;
+    if raw.len() < 56 + TX_LEVELS * 32 {
+        return Err(format!(
+            "merkle_tree account too short: {} bytes, need >= {}",
+            raw.len(),
+            56 + TX_LEVELS * 32
+        )
+        .into());
+    }
     let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
-    let leaf_index = next_index - 1;
+    let leaf_index = next_index
+        .checked_sub(1)
+        .ok_or("merkle_tree next_index is 0 — no leaves deposited yet")?;
     let root_onchain: [u8; 32] = raw[24..56].try_into()?;
     println!(
         "[2/5] on-chain tree: leaf {leaf_index}, root {}",
@@ -264,10 +279,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proof": hex::encode(&proof_bytes),
         "ciphertexts": [placeholder_0, placeholder_1],
     });
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{ingress}/transact/submit"))
-        .json(&body)
-        .send()?;
+    let mut req = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .post(format!("{ingress}/transact/submit"));
+    if let Ok(token) = std::env::var("BRIDGE_INGRESS_TOKEN") {
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    let resp = req.json(&body).send()?;
     let status = resp.status();
     let text = resp.text()?;
     println!("      {status}: {text}");
