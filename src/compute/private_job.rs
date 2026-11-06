@@ -114,11 +114,16 @@ impl PrivateComputeJob {
 
     /// Convert to standard compute job (for execution)
     pub fn to_compute_job(&self) -> ComputeJob {
-        ComputeJob::new(
+        let mut job = ComputeJob::new(
             self.wasm_code.clone(),
             self.encrypted_input.clone(),
             self.limits.clone(),
-        )
+        );
+        // Preserve this job's id: ComputeJob::new mints a fresh UUID, which
+        // would break job tracking and result correlation downstream
+        // (JobExecutor / VerificationCoordinator key off result.job_id).
+        job.id = self.job_id.clone();
+        job
     }
 
     /// Hash data to u64 (for commitment)
@@ -197,6 +202,17 @@ impl PrivateJobResult {
         result: JobResult,
         owner_address: &ShieldedAddress,
     ) -> Result<Self> {
+        // Only a successfully completed job may be finalized: a Failed or
+        // TimedOut result carrying partial/diagnostic output_data must not
+        // be wrapped into a valid PrivateJobResult with an execution proof.
+        if result.status != crate::compute::JobStatus::Completed {
+            return Err(anyhow!(
+                "Cannot finalize private result for non-completed job {} (status: {:?})",
+                result.job_id,
+                result.status
+            ));
+        }
+
         let output_data = result
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
@@ -244,28 +260,43 @@ impl PrivateJobResult {
         pk_path.exists() && vk_path.exists()
     }
 
+    /// Deserialize `T` from compressed bytes, rejecting trailing garbage.
+    ///
+    /// `ark_serialize` advances the slice reader without checking for EOF,
+    /// so a plain `deserialize_compressed(&bytes[..])` silently accepts
+    /// appended trailing bytes. Deserializing through a mutable cursor and
+    /// requiring it to be empty afterwards closes that hole.
+    fn deserialize_exact<T>(bytes: &[u8], what: &str) -> Result<T>
+    where
+        T: ark_serialize::CanonicalDeserialize,
+    {
+        let mut cursor = bytes;
+        let value = T::deserialize_compressed(&mut cursor)
+            .map_err(|e| anyhow!("Failed to deserialize {}: {}", what, e))?;
+        if !cursor.is_empty() {
+            return Err(anyhow!("Trailing bytes after {}", what));
+        }
+        Ok(value)
+    }
+
     /// Load compute proving key from disk
     fn load_proving_key() -> Result<ark_groth16::ProvingKey<ark_bn254::Bn254>> {
-        use ark_serialize::CanonicalDeserialize;
         use std::fs;
 
         let pk_bytes = fs::read("keys/compute_proving.key")
             .map_err(|e| anyhow!("Failed to read proving key: {}", e))?;
 
-        ark_groth16::ProvingKey::deserialize_compressed(&pk_bytes[..])
-            .map_err(|e| anyhow!("Failed to deserialize proving key: {}", e))
+        Self::deserialize_exact(&pk_bytes, "proving key")
     }
 
     /// Load compute verifying key from disk
     fn load_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bn254::Bn254>> {
-        use ark_serialize::CanonicalDeserialize;
         use std::fs;
 
         let vk_bytes = fs::read("keys/compute_verifying.key")
             .map_err(|e| anyhow!("Failed to read verifying key: {}", e))?;
 
-        ark_groth16::VerifyingKey::deserialize_compressed(&vk_bytes[..])
-            .map_err(|e| anyhow!("Failed to deserialize verifying key: {}", e))
+        Self::deserialize_exact(&vk_bytes, "verifying key")
     }
 
     /// Generate zkSNARK execution proof
@@ -398,12 +429,9 @@ impl PrivateJobResult {
             // Load verifying key
             let vk = Self::load_verifying_key()?;
 
-            // Deserialize proof
-            use ark_serialize::CanonicalDeserialize;
-            let proof = ark_groth16::Proof::<ark_bn254::Bn254>::deserialize_compressed(
-                proof_bytes.as_slice(),
-            )
-            .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+            // Deserialize proof (rejecting trailing bytes in the payload)
+            let proof: ark_groth16::Proof<ark_bn254::Bn254> =
+                Self::deserialize_exact(proof_bytes.as_slice(), "execution proof")?;
 
             // Public inputs for the v0.4 ComputeCircuit shape:
             //   [code_hash_fr, input_commitment, output_commitment, input_nullifier]
@@ -634,6 +662,60 @@ mod tests {
         let job = job.unwrap();
         assert!(!job.encrypted_input.is_empty());
         assert_ne!(job.code_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_to_compute_job_preserves_job_id() {
+        let wasm_code = vec![0x00, 0x61, 0x73, 0x6d]; // WASM magic number
+        let input_data = vec![1, 2, 3, 4];
+        let (address, _secret) = owner_keypair();
+        let job = PrivateComputeJob::new(wasm_code, input_data, address, ResourceLimits::default())
+            .unwrap();
+
+        let compute_job = job.to_compute_job();
+        assert_eq!(compute_job.id, job.job_id);
+    }
+
+    #[test]
+    fn test_from_job_result_rejects_failed_and_timed_out() {
+        let (address, _secret) = owner_keypair();
+        for status in [
+            crate::compute::JobStatus::Failed {
+                error: "boom".to_string(),
+            },
+            crate::compute::JobStatus::TimedOut,
+        ] {
+            let result = JobResult {
+                job_id: "job-1".to_string(),
+                status,
+                output_data: Some(vec![9, 9, 9]),
+                error: Some("boom".to_string()),
+                execution_time_ms: 1,
+                memory_used_bytes: 0,
+                instructions_executed: 0,
+            };
+            let err = PrivateJobResult::from_job_result("job-1".to_string(), result, &address)
+                .expect_err("non-completed result must be rejected");
+            assert!(err.to_string().contains("non-completed"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn test_deserialize_exact_rejects_trailing_bytes() {
+        use ark_serialize::CanonicalSerialize;
+        // ark_bn254::Fr round-trips through the same helper the key/proof
+        // loaders use, so this exercises the cursor-empty check directly.
+        let value = ark_bn254::Fr::from(42u64);
+        let mut bytes = Vec::new();
+        value.serialize_compressed(&mut bytes).unwrap();
+        let round_tripped: ark_bn254::Fr =
+            PrivateJobResult::deserialize_exact(&bytes, "field element").unwrap();
+        assert_eq!(round_tripped, value);
+
+        bytes.push(0xFF);
+        let err = PrivateJobResult::deserialize_exact::<ark_bn254::Fr>(&bytes, "field element")
+            .expect_err("trailing byte must be rejected");
+        assert!(err.to_string().contains("Trailing bytes"), "{}", err);
     }
 
     /// X25519 keypair for the confidential-compute tests: the public key is the
