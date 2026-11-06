@@ -312,6 +312,21 @@ impl TransferCircuitV2 {
 
 impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // Reject mismatched parallel witness vectors instead of panicking on
+        // `input_privkey_vars[i]` / `self.input_paths[i]` / ... below (#1387).
+        let n_ins = self.nullifiers.len();
+        let n_outs = self.output_commitments.len();
+        if self.input_values.len() != n_ins
+            || self.input_blindings.len() != n_ins
+            || self.input_privkeys.len() != n_ins
+            || self.input_paths.len() != n_ins
+            || self.output_values.len() != n_outs
+            || self.output_blindings.len() != n_outs
+            || self.output_pubkeys.len() != n_outs
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
         // --- Public inputs ---
         let merkle_root_var = FpVar::new_input(cs.clone(), || {
             Ok(self
@@ -647,6 +662,22 @@ impl Default for TransactCircuitV3 {
 
 impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // Reject short parallel witness vectors instead of panicking on
+        // `self.input_nullifiers[tx]` / `self.in_amounts[tx]` / ... below (#1387).
+        if self.input_nullifiers.len() < TX_NINS
+            || self.in_amounts.len() < TX_NINS
+            || self.in_privkeys.len() < TX_NINS
+            || self.in_blindings.len() < TX_NINS
+            || self.in_leaf_indices.len() < TX_NINS
+            || self.in_paths.len() < TX_NINS
+            || self.output_commitments.len() < TX_NOUTS
+            || self.out_amounts.len() < TX_NOUTS
+            || self.out_pubkeys.len() < TX_NOUTS
+            || self.out_blindings.len() < TX_NOUTS
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
         // Field-element public input from optional LE bytes.
         let input_fe = |cs: ConstraintSystemRef<Fr>, v: Option<[u8; 32]>| {
             FpVar::new_input(cs, || {
@@ -692,10 +723,13 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
 
             // leaf_index as 32 bits: gives both the field element (bound into the
             // signature/nullifier) and the per-level direction selectors.
+            // Reject indices >= 2^32 instead of silently truncating them with
+            // `i as u32` (#1387): a truncated index would bind the signature /
+            // nullifier to the wrong leaf.
             let idx_u32 = UInt32::new_witness(cs.clone(), || {
                 self.in_leaf_indices[tx]
-                    .map(|i| i as u32)
                     .ok_or(SynthesisError::AssignmentMissing)
+                    .and_then(|i| u32::try_from(i).map_err(|_| SynthesisError::Unsatisfiable))
             })?;
             let idx_bits = idx_u32.to_bits_le();
             let leaf_index_var = Boolean::le_bits_to_fp_var(&idx_bits)?;
@@ -1269,6 +1303,53 @@ mod tests {
         )));
     }
 
+    /// Mismatched parallel witness vectors are rejected with an error
+    /// instead of panicking on `input_privkey_vars[i]` / `self.input_paths[i]`
+    /// / `output_pubkey_vars[j]` / ... (#1387).
+    #[test]
+    fn transfer_v2_rejects_mismatched_parallel_vectors() {
+        let (root, nfs, vals, blinds, sks, paths) = two_input_tree();
+        let (opk0, opk1) = ([8u8; 32], [9u8; 32]);
+        let (ob0, ob1) = ([10u8; 32], [11u8; 32]);
+        let ocs = vec![v2_out_commit(opk0, 500, ob0), v2_out_commit(opk1, 500, ob1)];
+        let valid = || {
+            TransferCircuitV2::with_witness(
+                root,
+                nfs.clone(),
+                ocs.clone(),
+                vals.clone(),
+                blinds.clone(),
+                sks.clone(),
+                paths.clone(),
+                vec![500, 500],
+                vec![ob0, ob1],
+                vec![opk0, opk1],
+                [0u8; 32],
+            )
+        };
+        assert!(synth_v2_transfer(valid()));
+
+        // Short input side: one privkey for two nullifiers.
+        let mut c = valid();
+        c.input_privkeys.truncate(1);
+        assert!(!synth_v2_transfer(c));
+
+        // Short input side: one path for two nullifiers.
+        let mut c = valid();
+        c.input_paths.truncate(1);
+        assert!(!synth_v2_transfer(c));
+
+        // Short output side: one pubkey for two commitments.
+        let mut c = valid();
+        c.output_pubkeys.truncate(1);
+        assert!(!synth_v2_transfer(c));
+
+        // Long input side is also a mismatch.
+        let mut c = valid();
+        c.input_blindings.push(Some([0x42u8; 32]));
+        assert!(!synth_v2_transfer(c));
+    }
+
     // --- DepositCircuitV2 (spend-key construction, #293) ---
 
     fn synth_v2_deposit(c: DepositCircuitV2) -> bool {
@@ -1669,6 +1750,99 @@ mod tests {
                 [4u8; 32],
             );
             c.root = Some([0x55u8; 32]); // not the real membership root
+            assert!(!synth(c));
+        }
+
+        /// A leaf index >= 2^32 is rejected instead of being silently
+        /// truncated to its low 32 bits (#1387). The truncated index would
+        /// bind the signature/nullifier to the wrong leaf: `(1 << 32) + 1`
+        /// truncates to `1` with `i as u32`, which is the real index of the
+        /// input note here, so the pre-fix circuit satisfies.
+        #[test]
+        fn rejects_leaf_index_at_or_above_2_pow_32() {
+            let mut c = build(
+                [
+                    InNote {
+                        amount: 1000,
+                        privkey: Fr::from(13u64),
+                        blinding: Fr::from(13u64),
+                        index: 1,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(14u64),
+                        blinding: Fr::from(14u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 1000,
+                        pubkey: v3_pubkey(Fr::from(15u64)),
+                        blinding: Fr::from(9u64),
+                    },
+                    OutNote {
+                        amount: 0,
+                        pubkey: v3_pubkey(Fr::from(16u64)),
+                        blinding: Fr::from(10u64),
+                    },
+                ],
+                asset(),
+                [4u8; 32],
+            );
+            c.in_leaf_indices[0] = Some((1u64 << 32) + 1);
+            assert!(!synth(c));
+        }
+
+        /// Short parallel witness vectors are rejected with an error instead
+        /// of panicking on `self.in_amounts[tx]` / `self.input_nullifiers[tx]`
+        /// / `self.out_pubkeys[tx]` (#1387).
+        #[test]
+        fn rejects_short_parallel_witness_vectors() {
+            let build_valid = || {
+                build(
+                    [
+                        InNote {
+                            amount: 1000,
+                            privkey: Fr::from(13u64),
+                            blinding: Fr::from(13u64),
+                            index: 1,
+                        },
+                        InNote {
+                            amount: 0,
+                            privkey: Fr::from(14u64),
+                            blinding: Fr::from(14u64),
+                            index: 0,
+                        },
+                    ],
+                    [
+                        OutNote {
+                            amount: 1000,
+                            pubkey: v3_pubkey(Fr::from(15u64)),
+                            blinding: Fr::from(9u64),
+                        },
+                        OutNote {
+                            amount: 0,
+                            pubkey: v3_pubkey(Fr::from(16u64)),
+                            blinding: Fr::from(10u64),
+                        },
+                    ],
+                    asset(),
+                    [4u8; 32],
+                )
+            };
+            assert!(synth(build_valid()));
+
+            let mut c = build_valid();
+            c.in_amounts.truncate(1);
+            assert!(!synth(c));
+
+            let mut c = build_valid();
+            c.input_nullifiers.truncate(1);
+            assert!(!synth(c));
+
+            let mut c = build_valid();
+            c.out_pubkeys.truncate(1);
             assert!(!synth(c));
         }
 

@@ -68,8 +68,14 @@ pub fn circom_poseidon_gadget(
     inputs: &[FpVar<Fr>],
 ) -> Result<FpVar<Fr>, SynthesisError> {
     let width = inputs.len() + 1;
-    let params =
-        get_poseidon_parameters::<Fr>(width as u8).expect("circom Poseidon supports 1..=12 inputs");
+    // Reject empty / > 12-element inputs instead of panicking in
+    // `get_poseidon_parameters` (#1387). The `width as u8` cast below would
+    // also silently truncate for `inputs.len() >= 255`.
+    if !(1..=12).contains(&inputs.len()) {
+        return Err(SynthesisError::Unsatisfiable);
+    }
+    let params = get_poseidon_parameters::<Fr>(width as u8)
+        .map_err(|_| SynthesisError::Unsatisfiable)?;
 
     // state = [capacity=0, in0, in1, ...]
     let mut state: Vec<FpVar<Fr>> = Vec::with_capacity(width);
@@ -268,6 +274,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Empty and > 12-element inputs are rejected with `Err` instead of
+    /// panicking in `get_poseidon_parameters` (#1387).
+    #[test]
+    fn gadget_rejects_empty_and_oversize_inputs() {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let w = |x: Fr| FpVar::new_witness(cs.clone(), || Ok(x)).unwrap();
+
+        // Empty: no width-1 Poseidon exists.
+        let err = circom_poseidon_gadget(cs.clone(), &[]).unwrap_err();
+        assert!(matches!(err, SynthesisError::Unsatisfiable));
+
+        // 13 inputs: width 14 is outside the 1..=12 the syscall supports.
+        let many: Vec<FpVar<Fr>> = (0..13).map(|i| w(Fr::from(i as u64))).collect();
+        let err = circom_poseidon_gadget(cs.clone(), &many).unwrap_err();
+        assert!(matches!(err, SynthesisError::Unsatisfiable));
+
+        // 12 inputs (the widest supported) still works.
+        let max: Vec<FpVar<Fr>> = (0..12).map(|i| w(Fr::from(i as u64))).collect();
+        let out = circom_poseidon_gadget(cs.clone(), &max).unwrap();
+        let want = circom_poseidon(&(0..12).map(|i| Fr::from(i as u64)).collect::<Vec<_>>());
+        assert_eq!(out.value().unwrap(), want);
     }
 
     /// The v3 note-hash helpers (pubkey/commit/signature/nullifier/merkle) each
