@@ -232,10 +232,17 @@ impl ReqwestJupiterClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            http,
-            base_url: base_url.into(),
-        }
+        // Trim trailing slashes so the `/quote` and `/swap` joins below never
+        // produce malformed `//quote` / `//swap` URLs.
+        let base_url = base_url.into();
+        let base_url = base_url.trim_end_matches('/').to_string();
+        Self { http, base_url }
+    }
+
+    /// The configured base URL (test seam: asserts the trailing-slash trim).
+    #[cfg(test)]
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Send with a small retry on 429 / 5xx / transport timeouts, and surface the
@@ -446,9 +453,18 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         platform_fee_bps: u16,
         fee_account: Option<String>,
     ) -> Result<Self> {
-        if platform_fee_bps > 0 && fee_account.is_none() {
+        if slippage_bps > 10_000 {
+            return Err(RelayerError::SlippageTooHigh(slippage_bps));
+        }
+        if platform_fee_bps > 0
+            && fee_account
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+        {
             return Err(RelayerError::SwapFailed(
-                "platform_fee_bps > 0 requires a fee_account".into(),
+                "platform_fee_bps > 0 requires a non-empty fee_account".into(),
             ));
         }
         if platform_fee_bps > 10_000 {
@@ -514,9 +530,15 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         if quote.route_plan.is_empty() {
             return Err(RelayerError::NoRoute("empty routePlan".into()));
         }
-        quote.out_amount.parse::<u64>().map_err(|e| {
+        let out_amount = quote.out_amount.parse::<u64>().map_err(|e| {
             RelayerError::SwapFailed(format!("bad outAmount '{}': {e}", quote.out_amount))
-        })
+        })?;
+        if out_amount == 0 {
+            return Err(RelayerError::SwapFailed(
+                "quote returned zero outAmount".into(),
+            ));
+        }
+        Ok(out_amount)
     }
 
     /// Decode Jupiter's base64 `swapTransaction` into a [`VersionedTransaction`].
@@ -547,6 +569,11 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
     ) -> Result<(u64, serde_json::Value)> {
         if amount == 0 {
             return Err(RelayerError::InvalidAmount(0));
+        }
+        if asset_in == asset_out {
+            return Err(RelayerError::SwapFailed(
+                "same-asset swap: input and output mints are identical".into(),
+            ));
         }
         let input_mint = asset_to_mint(asset_in);
         let output_mint = asset_to_mint(asset_out);
@@ -646,6 +673,14 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
                 .await?
                 .unwrap_or(out_amount)
         };
+
+        // A zero realized output (balance at/below the native deposit reserve,
+        // or a zero token balance) is not a swap worth re-shielding: reject it
+        // rather than returning `Ok(SwapResult { out_amount: 0 })` and letting
+        // the orchestrator re-deposit a zero-value note.
+        if out_amount == 0 {
+            return Err(RelayerError::SwapFailed("swap produced zero output".into()));
+        }
 
         Ok(SwapResult { out_amount })
     }
@@ -869,6 +904,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slippage_over_100_percent_is_rejected() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        match JupiterSwapProvider::new(http, RecordingSubmitter::default(), 10_001, 0, None) {
+            Err(RelayerError::SlippageTooHigh(10_001)) => {}
+            Err(other) => panic!("expected SlippageTooHigh, got {other:?}"),
+            Ok(_) => panic!("expected construction to fail"),
+        }
+        // Exactly 100% is the boundary and still constructs.
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        assert!(
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 10_000, 0, None).is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_or_whitespace_fee_account_is_rejected() {
+        for account in ["", "   ", "\t\n"] {
+            let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+            match JupiterSwapProvider::new(
+                http,
+                RecordingSubmitter::default(),
+                50,
+                30,
+                Some(account.into()),
+            ) {
+                Err(RelayerError::SwapFailed(_)) => {}
+                Err(other) => panic!("fee_account {account:?}: expected SwapFailed, got {other:?}"),
+                Ok(_) => panic!("fee_account {account:?}: expected construction to fail"),
+            }
+        }
+        // An empty fee account is fine when no platform fee is configured.
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        assert!(JupiterSwapProvider::new(
+            http,
+            RecordingSubmitter::default(),
+            50,
+            0,
+            Some("".into())
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn trailing_slash_base_url_is_trimmed() {
+        let client = ReqwestJupiterClient::new("https://lite-api.jup.ag/swap/v1/");
+        assert_eq!(client.base_url(), "https://lite-api.jup.ag/swap/v1");
+        let client = ReqwestJupiterClient::new("https://lite-api.jup.ag/swap/v1");
+        assert_eq!(client.base_url(), "https://lite-api.jup.ag/swap/v1");
+    }
+
+    #[test]
+    fn zero_out_amount_quote_is_rejected_despite_a_route() {
+        let quote = serde_json::json!({
+            "outAmount": "0",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let err = JupiterSwapProvider::<CannedClient, RecordingSubmitter>::parse_quote(&quote)
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
+    }
+
     // --- Full swap flow over the seams (no network) --------------------
 
     #[tokio::test]
@@ -973,5 +1070,86 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn same_asset_swap_is_rejected_before_any_request() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let provider =
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 50, 0, None).unwrap();
+        let err = provider
+            .swap(NATIVE_SOL_ASSET, NATIVE_SOL_ASSET, 5_000, &Keypair::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
+        // No quote was ever requested.
+        assert!(provider.http.seen_query.lock().unwrap().is_none());
+        assert!(provider.submitter.signed_pubkey.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_realized_native_output_is_rejected() {
+        // The ephemeral holds 5_000 lamports after the swap — at/below the
+        // 10_000-lamport deposit reserve, so the realized output is 0 and the
+        // swap must fail instead of returning a zero `SwapResult`.
+        struct SmallBalanceSubmitter;
+        #[async_trait::async_trait]
+        impl SwapSubmitter for SmallBalanceSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(5_000))
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "1000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider = JupiterSwapProvider::new(http, SmallBalanceSubmitter, 50, 0, None).unwrap();
+        let err = provider
+            .swap([0x33u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn zero_realized_token_output_is_rejected() {
+        // The quote promises output, but the token account actually holds 0 —
+        // the swap must fail rather than hand the orchestrator a zero amount
+        // to re-deposit.
+        struct ZeroBalanceSubmitter;
+        #[async_trait::async_trait]
+        impl SwapSubmitter for ZeroBalanceSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn realized_output(&self, _o: &Pubkey, _m: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(0))
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "987654",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider = JupiterSwapProvider::new(http, ZeroBalanceSubmitter, 50, 0, None).unwrap();
+        let err = provider
+            .swap(NATIVE_SOL_ASSET, [0x11u8; 32], 1_000_000, &Keypair::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
     }
 }

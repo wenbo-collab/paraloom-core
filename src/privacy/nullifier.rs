@@ -77,10 +77,16 @@ impl NullifierSet {
     }
 
     /// Batch check multiple nullifiers
-    /// Returns true if ALL nullifiers are new (not yet spent)
+    /// Returns true if ALL nullifiers are new (not yet spent) AND the batch
+    /// itself contains no duplicates: `check_batch(&[n, n])` must fail, since
+    /// each element is individually unspent but the pair is an intra-batch
+    /// double-spend.
     pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
         let set = self.nullifiers.read().await;
-        nullifiers.iter().all(|n| !set.contains(n))
+        let mut seen = HashSet::with_capacity(nullifiers.len());
+        nullifiers
+            .iter()
+            .all(|n| !set.contains(n) && seen.insert(n))
     }
 
     /// Batch insert multiple nullifiers, returning the count of newly
@@ -92,9 +98,14 @@ impl NullifierSet {
     pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
 
+        // Deduplicate within the batch first: without this, `[n, n]` passes
+        // the membership filter twice, hands a duplicate to
+        // `insert_nullifiers_batch`, and returns an inflated count (2) for
+        // the one unique nullifier actually added.
+        let mut seen = HashSet::new();
         let new_nullifiers: Vec<Nullifier> = nullifiers
             .into_iter()
-            .filter(|n| !set.contains(n))
+            .filter(|n| !set.contains(n) && seen.insert(n.clone()))
             .collect();
 
         if new_nullifiers.is_empty() {
@@ -232,6 +243,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_nullifier_set_batch_check_rejects_intra_batch_duplicates() {
+        let set = NullifierSet::new();
+        let nullifier = Nullifier([1u8; 32]);
+
+        // Each element is individually unspent, but the pair is an
+        // intra-batch double-spend and must fail.
+        assert!(!set.check_batch(&[nullifier.clone(), nullifier]).await);
+        // A single element still passes.
+        assert!(set.check_batch(&[Nullifier([1u8; 32])]).await);
+    }
+
+    #[tokio::test]
     async fn test_nullifier_set_batch_insert() {
         let set = NullifierSet::new();
         let nullifiers = vec![
@@ -255,6 +278,31 @@ mod tests {
             .expect("in-memory batch insert");
         assert_eq!(count, 0); // No new inserts
         assert_eq!(set.len().await, 3);
+    }
+
+    #[tokio::test]
+    async fn test_nullifier_set_batch_insert_deduplicates_within_batch() {
+        let set = NullifierSet::new();
+        // Two copies of [1u8; 32] plus one [2u8; 32]: only 2 unique
+        // nullifiers exist, so the reported count must be 2, not 3.
+        let count = set
+            .insert_batch(vec![
+                Nullifier([1u8; 32]),
+                Nullifier([1u8; 32]),
+                Nullifier([2u8; 32]),
+            ])
+            .await
+            .expect("in-memory batch insert");
+        assert_eq!(count, 2);
+        assert_eq!(set.len().await, 2);
+
+        // Re-inserting the same duplicated batch adds nothing.
+        let count = set
+            .insert_batch(vec![Nullifier([1u8; 32]), Nullifier([1u8; 32])])
+            .await
+            .expect("in-memory batch insert");
+        assert_eq!(count, 0);
+        assert_eq!(set.len().await, 2);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 
 use crate::privacy::types::{Commitment, Note, Nullifier, ShieldedAddress};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// A shielded transaction
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,12 +99,15 @@ impl DepositTx {
         asset_id: crate::privacy::types::AssetId,
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
+        // Saturating subtraction: a fee larger than the amount must not panic
+        // with an integer underflow (verify() then rejects it as invalid).
+        let output_note = Note::new(recipient, amount.saturating_sub(fee), randomness, asset_id);
         let output_commitment = output_note.commitment();
 
+        // A pre-epoch clock must not panic the constructor; fall back to 0.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         DepositTx {
@@ -119,6 +123,14 @@ impl DepositTx {
 
     /// Verify deposit transaction
     pub fn verify(&self) -> bool {
+        // Zero-amount deposits and deposits with no sender are invalid.
+        if self.amount == 0 {
+            return false;
+        }
+        if self.from_public.is_empty() {
+            return false;
+        }
+
         // Check amount covers fee
         if self.amount < self.fee {
             return false;
@@ -180,9 +192,10 @@ impl TransferTx {
         let output_commitments: Vec<Commitment> =
             output_notes.iter().map(|note| note.commitment()).collect();
 
+        // A pre-epoch clock must not panic the constructor; fall back to 0.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         TransferTx {
@@ -201,6 +214,26 @@ impl TransferTx {
     pub fn verify_structure(&self) -> bool {
         // Must have inputs and outputs
         if self.input_nullifiers.is_empty() || self.output_commitments.is_empty() {
+            return false;
+        }
+
+        // No nullifier or commitment may repeat within one transfer: a
+        // duplicated input spends the same note twice, and a duplicated
+        // output commitment mints the same note twice.
+        let mut seen_nullifiers = HashSet::new();
+        if !self
+            .input_nullifiers
+            .iter()
+            .all(|n| seen_nullifiers.insert(n))
+        {
+            return false;
+        }
+        let mut seen_commitments = HashSet::new();
+        if !self
+            .output_commitments
+            .iter()
+            .all(|c| seen_commitments.insert(c))
+        {
             return false;
         }
 
@@ -259,9 +292,10 @@ impl WithdrawTx {
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
 
+        // A pre-epoch clock must not panic the constructor; fall back to 0.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         WithdrawTx {
@@ -278,6 +312,11 @@ impl WithdrawTx {
 
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
+        // Zero-amount withdrawals are invalid.
+        if self.amount == 0 {
+            return false;
+        }
+
         // Amount must cover fee
         if self.amount < self.fee {
             return false;
@@ -340,6 +379,9 @@ impl TrackedTransaction {
     /// Mark as rejected
     pub fn mark_rejected(&mut self, reason: String) {
         self.status = TransactionStatus::Rejected { reason };
+        // A rejected transaction carries no confirmations: leaving a
+        // non-zero count intact would report a failed tx as confirmed.
+        self.confirmations = 0;
     }
 }
 
@@ -445,5 +487,89 @@ mod tests {
         );
 
         assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn test_deposit_fee_exceeding_amount_does_not_panic() {
+        // amount < fee used to panic with an integer underflow in
+        // `new_asset` (`amount - fee`); it must construct (with a zero-value
+        // note) and then fail verification.
+        let tx = DepositTx::new(vec![1u8; 32], 5, ShieldedAddress([2u8; 32]), [3u8; 32], 10);
+        assert_eq!(tx.output_note.amount, 0);
+        assert!(!tx.verify());
+    }
+
+    #[test]
+    fn test_zero_amount_deposit_and_withdraw_fail_verify() {
+        let deposit = DepositTx::new(vec![1u8; 32], 0, ShieldedAddress([2u8; 32]), [3u8; 32], 0);
+        assert!(!deposit.verify());
+
+        let withdraw = WithdrawTx::new(Nullifier([1u8; 32]), 0, vec![5u8; 32], [0u8; 32], 0);
+        assert!(!withdraw.verify());
+    }
+
+    #[test]
+    fn test_deposit_with_empty_sender_fails_verify() {
+        let tx = DepositTx::new(
+            vec![], // Empty from_public - invalid
+            1000,
+            ShieldedAddress([2u8; 32]),
+            [3u8; 32],
+            10,
+        );
+        assert!(!tx.verify());
+    }
+
+    #[test]
+    fn test_transfer_duplicate_nullifier_fails_structure() {
+        let tx = TransferTx::new(
+            vec![Nullifier([1u8; 32]), Nullifier([1u8; 32])], // Same note twice
+            vec![Note::new_native(
+                ShieldedAddress([10u8; 32]),
+                500,
+                [1u8; 32],
+            )],
+            [0u8; 32],
+            10,
+        );
+        assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn test_transfer_duplicate_commitment_fails_structure() {
+        // Two identical notes produce identical commitments: the same note
+        // minted twice within one transfer.
+        let note = Note::new_native(ShieldedAddress([10u8; 32]), 500, [1u8; 32]);
+        let tx = TransferTx::new(
+            vec![Nullifier([1u8; 32]), Nullifier([2u8; 32])],
+            vec![note.clone(), note],
+            [0u8; 32],
+            10,
+        );
+        assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn test_mark_rejected_resets_confirmations() {
+        let tx = ShieldedTransaction::Deposit(DepositTx::new(
+            vec![1u8; 32],
+            1000,
+            ShieldedAddress([2u8; 32]),
+            [3u8; 32],
+            10,
+        ));
+
+        let mut tracked = TrackedTransaction::new(tx);
+        tracked.mark_verified();
+        assert_eq!(tracked.confirmations, 1);
+
+        tracked.mark_rejected("invalid proof".to_string());
+        assert_eq!(
+            tracked.status,
+            TransactionStatus::Rejected {
+                reason: "invalid proof".to_string()
+            }
+        );
+        assert_eq!(tracked.confirmations, 0);
     }
 }

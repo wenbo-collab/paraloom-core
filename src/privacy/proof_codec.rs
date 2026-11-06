@@ -21,8 +21,10 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    check_fully_consumed(&cursor, bytes, "proof")?;
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -36,8 +38,10 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    check_fully_consumed(&cursor, bytes, "verifying key")?;
+    Ok(vk)
 }
 
 /// Convert field element to bytes (32 bytes, big-endian)
@@ -56,8 +60,25 @@ pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
 /// Convert bytes to field element
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
     let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    check_fully_consumed(&cursor, bytes, "field element")?;
+    Ok(field)
+}
+
+/// Reject trailing bytes after a compressed deserialisation: arkworks'
+/// `deserialize_compressed` stops after the value it read, so without this
+/// check an attacker can append arbitrary bytes to a proof, verifying key,
+/// or field element and have them silently accepted.
+fn check_fully_consumed(cursor: &Cursor<&[u8]>, bytes: &[u8], what: &str) -> Result<()> {
+    let consumed = cursor.position() as usize;
+    if consumed != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes after {what}: consumed {consumed} of {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -284,6 +305,90 @@ mod tests {
     fn bytes_to_field_above_modulus_errors() {
         let buf = [0xFFu8; 32];
         assert!(bytes_to_field(&buf).is_err());
+    }
+
+    // ── Trailing bytes: a valid value with junk appended ──────────────
+    //
+    // arkworks' `deserialize_compressed` stops after the value it read, so
+    // these tests need a genuinely valid proof / verifying key / field
+    // element — random bytes would fail before the trailing-byte check is
+    // even reached. A trivial circuit gives us real ones.
+
+    #[derive(Clone)]
+    struct TrivialCircuit;
+
+    impl ark_relations::r1cs::ConstraintSynthesizer<Fr> for TrivialCircuit {
+        fn generate_constraints(
+            self,
+            cs: ark_relations::r1cs::ConstraintSystemRef<Fr>,
+        ) -> std::result::Result<(), ark_relations::r1cs::SynthesisError> {
+            let a = cs.new_witness_variable(|| Ok(Fr::from(3u32)))?;
+            let b = cs.new_witness_variable(|| Ok(Fr::from(5u32)))?;
+            let c = cs.new_input_variable(|| Ok(Fr::from(15u32)))?;
+            cs.enforce_constraint(
+                ark_relations::lc!() + a,
+                ark_relations::lc!() + b,
+                ark_relations::lc!() + c,
+            )?;
+            Ok(())
+        }
+    }
+
+    /// Serialize a real proof and its verifying key from a trivial circuit.
+    fn real_proof_and_vk_bytes() -> (Vec<u8>, Vec<u8>) {
+        use ark_groth16::Groth16;
+        use ark_snark::SNARK;
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xFEED_FACE_u64);
+        let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+        let proof = Groth16::<Bn254>::prove(&pk, TrivialCircuit, &mut rng).unwrap();
+        (serialize_proof(&proof).unwrap(), serialize_vk(&vk).unwrap())
+    }
+
+    #[test]
+    fn proof_and_vk_round_trip() {
+        let (proof_bytes, vk_bytes) = real_proof_and_vk_bytes();
+        let proof = deserialize_proof(&proof_bytes).expect("valid proof round-trips");
+        assert_eq!(serialize_proof(&proof).unwrap(), proof_bytes);
+        let vk = deserialize_vk(&vk_bytes).expect("valid vk round-trips");
+        assert_eq!(serialize_vk(&vk).unwrap(), vk_bytes);
+    }
+
+    #[test]
+    fn deserialize_proof_rejects_trailing_bytes() {
+        let (mut proof_bytes, _) = real_proof_and_vk_bytes();
+        // The exact-length encoding must parse.
+        assert!(deserialize_proof(&proof_bytes).is_ok());
+        // One appended byte — or a whole appended blob — must not.
+        proof_bytes.push(0xFF);
+        assert!(
+            deserialize_proof(&proof_bytes).is_err(),
+            "a proof with trailing bytes must be rejected"
+        );
+        proof_bytes.extend_from_slice(&[0u8; 64]);
+        assert!(deserialize_proof(&proof_bytes).is_err());
+    }
+
+    #[test]
+    fn deserialize_vk_rejects_trailing_bytes() {
+        let (_, mut vk_bytes) = real_proof_and_vk_bytes();
+        assert!(deserialize_vk(&vk_bytes).is_ok());
+        vk_bytes.push(0x00);
+        assert!(
+            deserialize_vk(&vk_bytes).is_err(),
+            "a verifying key with trailing bytes must be rejected"
+        );
+    }
+
+    #[test]
+    fn bytes_to_field_rejects_trailing_bytes() {
+        let field = Fr::from(42u64);
+        let mut bytes = field_to_bytes(&field).to_vec();
+        assert!(bytes_to_field(&bytes).is_ok());
+        bytes.push(0x00);
+        assert!(
+            bytes_to_field(&bytes).is_err(),
+            "a field element with trailing bytes must be rejected"
+        );
     }
 
     // ── Proof-suite envelope ──────────────────────────────────────────

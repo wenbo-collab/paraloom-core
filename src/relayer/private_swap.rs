@@ -65,6 +65,10 @@ pub enum RelayerError {
     #[error("fee_bps {0} exceeds 10000 (100%)")]
     FeeTooHigh(u16),
 
+    /// `slippage_bps` exceeded 10_000 (100%), which would accept any fill.
+    #[error("slippage_bps {0} exceeds 10000 (100%)")]
+    SlippageTooHigh(u16),
+
     /// The configured swap provider failed to route or quote the trade.
     #[error("swap provider failed: {0}")]
     SwapFailed(String),
@@ -401,33 +405,16 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
-        // Step 1: withdraw the spent note to the fresh address via a v3
-        // transact. The submitter takes the note's v3 spend witness, proves the
-        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
-        // the nullifier burn severs the deposit -> fresh-address link on-chain.
-        let withdraw_leg = self
-            .submitter
-            .submit_withdraw_to_fresh(
-                in_leg,
-                amount_in,
-                request.in_sk,
-                request.in_blinding,
-                request.in_note_pubkey,
-                request.in_leaf_index,
-                fresh_address,
-            )
-            .await?;
-
-        // Step 2: swap on public liquidity from the fresh address. The provider
-        // signs and submits the public trade from `ephemeral`, so the trade
-        // originates at the unlinkable fresh address.
-        //
-        // The on-chain withdraw deducts the protocol withdrawal fee
+        // Validate the fee/overhead accounting BEFORE burning the nullifier:
+        // the on-chain withdraw deducts the protocol withdrawal fee
         // (`WITHDRAWAL_FEE_BPS`, credited to the settling validator), so the
         // fresh address holds `amount_in - fee`, not the gross note value.
-        // Swapping the gross amount would exceed the fresh address's balance and
-        // fail *after* the nullifier is already burned, stranding the funds —
-        // so the swap trades the realized post-fee amount.
+        // Computing this after `submit_withdraw_to_fresh` meant a too-small
+        // `amount_in` spent the note on-chain first and then aborted with
+        // `InvalidAmount` before swapping, stranding the withdrawn funds.
+        // Swapping the gross amount would likewise exceed the fresh address's
+        // balance and fail *after* the nullifier is already burned — so the
+        // swap trades the realized post-fee amount.
         let withdrawal_fee = amount_in
             .checked_mul(WITHDRAWAL_FEE_BPS)
             .map(|x| x / 10_000)
@@ -449,10 +436,38 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         } else {
             withdrawn
         };
+
+        // Step 1: withdraw the spent note to the fresh address via a v3
+        // transact. The submitter takes the note's v3 spend witness, proves the
+        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
+        // the nullifier burn severs the deposit -> fresh-address link on-chain.
+        let withdraw_leg = self
+            .submitter
+            .submit_withdraw_to_fresh(
+                in_leg,
+                amount_in,
+                request.in_sk,
+                request.in_blinding,
+                request.in_note_pubkey,
+                request.in_leaf_index,
+                fresh_address,
+            )
+            .await?;
+
+        // Step 2: swap on public liquidity from the fresh address. The provider
+        // signs and submits the public trade from `ephemeral`, so the trade
+        // originates at the unlinkable fresh address.
         let swap = self
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
             .await?;
+
+        // A zero-output swap must not proceed to re-deposit a zero-value note
+        // (or hand over nothing on the swap-out path): reject it here, before
+        // the slippage floor and any downstream leg acts on it.
+        if swap.out_amount == 0 {
+            return Err(RelayerError::SwapFailed("swap returned zero output".into()));
+        }
 
         // Independent slippage floor. The provider enforces its own slippage
         // bound on-chain, but that is a single value fixed when the relayer is
@@ -742,6 +757,45 @@ mod tests {
             .await
             .expect_err("overhead consuming the whole note must fail, not swap 0");
         assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
+    }
+
+    #[tokio::test]
+    async fn overhead_rejection_happens_before_the_nullifier_is_burned() {
+        // The fee/overhead accounting is validated before the withdraw leg:
+        // a note too small to cover the overhead must fail with NO leg
+        // submitted — the note stays unspent instead of being burned
+        // on-chain and then stranded by the abort.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(1_000);
+        let err = relayer
+            .execute(request(native_note(1_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("overhead consuming the whole note must fail");
+        assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
+        assert!(
+            relayer.submitter.recorded().is_empty(),
+            "no leg may be submitted when the pre-flight accounting fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_output_swap_is_rejected_before_redeposit() {
+        // A provider that returns zero output (rate 0) must abort instead of
+        // re-depositing a zero-value note: the withdraw leg settles, but no
+        // deposit leg is ever submitted.
+        let relayer =
+            PrivateSwapRelayer::new(MockSwapProvider::with_rate(0, 1), MockSubmitter::new());
+        let err = relayer
+            .execute(request(native_note(1_000_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("zero-output swap must fail");
+        assert!(
+            matches!(err, RelayerError::SwapFailed(_)),
+            "expected SwapFailed, got {err:?}"
+        );
+        let legs = relayer.submitter.recorded();
+        assert_eq!(legs.len(), 1, "only the withdraw leg may settle");
+        assert_eq!(legs[0].leg, WithdrawLeg::Native);
     }
 
     #[tokio::test]
