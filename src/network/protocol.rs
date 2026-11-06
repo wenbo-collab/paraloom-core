@@ -1206,10 +1206,15 @@ impl NetworkManager {
     /// `interval` should be on the order of minutes; libp2p's own
     /// guidance suggests 5 minutes for healthy networks. The
     /// returned JoinHandle lets the caller `abort()` on shutdown.
+    /// A zero interval is clamped to a 1ms floor:
+    /// `tokio::time::interval` panics on `Duration::ZERO`, and a
+    /// misconfigured caller must never kill the refresh task at
+    /// spawn time.
     pub fn start_kad_bootstrap_refresh(
         self: Arc<Self>,
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        let interval = interval.max(std::time::Duration::from_millis(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1296,6 +1301,22 @@ mod tests {
         mgr.connect_to_bootstrap(Vec::new())
             .await
             .expect("empty bootstrap is a no-op");
+    }
+
+    #[tokio::test]
+    async fn kad_bootstrap_refresh_clamps_zero_interval() {
+        let mgr =
+            Arc::new(NetworkManager::new(&Settings::development()).expect("network manager"));
+        // Duration::ZERO used to panic inside tokio::time::interval
+        // at spawn time; it must now clamp to a 1ms floor and keep
+        // the refresh task alive.
+        let handle = mgr.start_kad_bootstrap_refresh(std::time::Duration::ZERO);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "refresh task must survive a zero interval"
+        );
+        handle.abort();
     }
 
     #[tokio::test]

@@ -182,8 +182,17 @@ impl PeerRegistry {
             } => consecutive_failures.saturating_add(1),
             _ => 1,
         };
-        let backoff_idx = next_failure_count.min(RECONNECT_BACKOFF.len()) - 1;
-        let retry_at = now + RECONNECT_BACKOFF[backoff_idx];
+        let backoff_idx = next_failure_count
+            .saturating_sub(1)
+            .min(RECONNECT_BACKOFF.len().saturating_sub(1));
+        // `.get` (not indexing) so an empty table degrades to the
+        // default delay instead of panicking, and `checked_add`
+        // so an overflowing retry instant degrades to `now`.
+        let delay = RECONNECT_BACKOFF
+            .get(backoff_idx)
+            .copied()
+            .unwrap_or(Duration::from_secs(10));
+        let retry_at = now.checked_add(delay).unwrap_or(now);
         entry.state = PeerState::Backoff {
             retry_at,
             consecutive_failures: next_failure_count,
@@ -192,7 +201,7 @@ impl PeerRegistry {
             target: "paraloom::network::discovery",
             "peer {:?} disconnected; next retry in {:?} (failure #{})",
             node_id,
-            RECONNECT_BACKOFF[backoff_idx],
+            delay,
             next_failure_count
         );
     }
@@ -351,6 +360,32 @@ mod tests {
                 let delay = *retry_at - now(&clock);
                 let max = *RECONNECT_BACKOFF.last().unwrap();
                 assert_eq!(delay, max, "saturated delay should be {:?}", max);
+            }
+            other => panic!("expected Backoff, got {:?}", other),
+        }
+    }
+
+    /// Disconnecting far past the end of the backoff table never
+    /// panics: the index saturates at the last entry and the retry
+    /// instant is computed with a checked add, so the delay stays
+    /// at the 5-minute max no matter how many failures pile up.
+    #[test]
+    fn many_disconnects_saturate_without_panic() {
+        let (mut registry, clock) = registry_with_fake_clock();
+        let peer = node(9);
+
+        for _ in 0..20 {
+            registry.mark_disconnected(peer.clone());
+        }
+
+        match &registry.summaries()[0].state {
+            PeerState::Backoff {
+                retry_at,
+                consecutive_failures,
+            } => {
+                assert_eq!(*consecutive_failures, 20);
+                let delay = *retry_at - now(&clock);
+                assert_eq!(delay, *RECONNECT_BACKOFF.last().unwrap());
             }
             other => panic!("expected Backoff, got {:?}", other),
         }

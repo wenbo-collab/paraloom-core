@@ -107,10 +107,24 @@ pub fn contribute<R: RngCore + CryptoRng>(
 }
 
 /// Read a `ProvingKey<Bn254>` from a compressed-arkworks file.
+///
+/// Trailing bytes are rejected: the file hash must bind 1-to-1 to
+/// the deserialized key (callers hash the raw file bytes for
+/// `initial_srs_hash`), so a file that deserializes to the same key
+/// plus extra garbage is malformed, not a valid key.
 pub fn read_pk(path: &Path) -> Result<ProvingKey<Bn254>, ContributeError> {
     let bytes = fs::read(path)?;
-    ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
-        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))
+    let mut cursor = &bytes[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))?;
+    if !cursor.is_empty() {
+        return Err(ContributeError::Deserialize(format!(
+            "ProvingKey at {:?}: {} trailing byte(s) after the ProvingKey",
+            path,
+            cursor.len()
+        )));
+    }
+    Ok(pk)
 }
 
 /// Write a `ProvingKey<Bn254>` to a compressed-arkworks file.
@@ -124,6 +138,18 @@ pub fn write_pk(pk: &ProvingKey<Bn254>, path: &Path) -> Result<(), ContributeErr
 /// caller wanting a different on-disk format should not use this
 /// helper — bincode-shaped artefacts go through
 /// `write_transcript` instead.
+/// Create the parent directories of `path` when they are missing,
+/// so a fresh output directory does not fail a write after minutes
+/// of ceremony computation. A bare filename (no parent) is a no-op.
+fn ensure_parent_dir(path: &Path) -> Result<(), ContributeError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn write_compressed<T>(value: &T, path: &Path) -> Result<(), ContributeError>
 where
     T: ark_serialize::CanonicalSerialize,
@@ -132,15 +158,29 @@ where
     value
         .serialize_compressed(&mut bytes)
         .map_err(|e| ContributeError::Serialize(format!("{:?}: {}", path, e)))?;
+    ensure_parent_dir(path)?;
     fs::write(path, &bytes)?;
     Ok(())
 }
 
 /// Read a `Phase2Transcript` from a bincode file.
+///
+/// Trailing bytes are rejected, mirroring `read_pk`: the whole
+/// file must be exactly one transcript.
 pub fn read_transcript(path: &Path) -> Result<Phase2Transcript, ContributeError> {
     let bytes = fs::read(path)?;
-    bincode::deserialize::<Phase2Transcript>(&bytes)
-        .map_err(|e| ContributeError::Deserialize(format!("Phase2Transcript at {:?}: {}", path, e)))
+    let mut cursor = io::Cursor::new(&bytes[..]);
+    let transcript: Phase2Transcript = bincode::deserialize_from(&mut cursor).map_err(|e| {
+        ContributeError::Deserialize(format!("Phase2Transcript at {:?}: {}", path, e))
+    })?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(ContributeError::Deserialize(format!(
+            "Phase2Transcript at {:?}: {} trailing byte(s) after the transcript",
+            path,
+            bytes.len() - cursor.position() as usize
+        )));
+    }
+    Ok(transcript)
 }
 
 /// Write a `Phase2Transcript` to a bincode file.
@@ -148,6 +188,7 @@ pub fn write_transcript(transcript: &Phase2Transcript, path: &Path) -> Result<()
     let bytes = bincode::serialize(transcript).map_err(|e| {
         ContributeError::Serialize(format!("Phase2Transcript to {:?}: {}", path, e))
     })?;
+    ensure_parent_dir(path)?;
     fs::write(path, &bytes)?;
     Ok(())
 }
@@ -240,5 +281,80 @@ mod tests {
         assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
+    }
+
+    fn fresh_transcript() -> Phase2Transcript {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+        let (_pk, transcript) = contribute(
+            initial_pk,
+            None,
+            CircuitId::Deposit,
+            [0u8; 64],
+            NodeId(vec![0x01]),
+            "test contributor".to_string(),
+            &mut rng,
+        )
+        .expect("contribution succeeds");
+        transcript
+    }
+
+    #[test]
+    fn read_pk_rejects_trailing_garbage_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pk_path = dir.path().join("pk.key");
+        write_pk(&fresh_initial_pk(), &pk_path).expect("write pk");
+
+        let mut bytes = fs::read(&pk_path).expect("read pk bytes");
+        bytes.extend_from_slice(b"trailing garbage");
+        fs::write(&pk_path, &bytes).expect("append garbage");
+
+        let err = read_pk(&pk_path).expect_err("trailing bytes must be rejected");
+        assert!(
+            matches!(err, ContributeError::Deserialize(_)),
+            "expected Deserialize error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn read_transcript_rejects_trailing_garbage_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tx_path = dir.path().join("transcript.bin");
+        write_transcript(&fresh_transcript(), &tx_path).expect("write transcript");
+
+        let mut bytes = fs::read(&tx_path).expect("read transcript bytes");
+        bytes.extend_from_slice(b"trailing garbage");
+        fs::write(&tx_path, &bytes).expect("append garbage");
+
+        let err = read_transcript(&tx_path).expect_err("trailing bytes must be rejected");
+        assert!(
+            matches!(err, ContributeError::Deserialize(_)),
+            "expected Deserialize error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn write_pk_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pk_path = dir.path().join("nested").join("deep").join("pk.key");
+        let pk = fresh_initial_pk();
+
+        write_pk(&pk, &pk_path).expect("write pk into missing parent dirs");
+        let round_tripped = read_pk(&pk_path).expect("read back written pk");
+        assert_eq!(round_tripped, pk);
+    }
+
+    #[test]
+    fn write_transcript_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tx_path = dir.path().join("nested").join("deep").join("transcript.bin");
+        let transcript = fresh_transcript();
+
+        write_transcript(&transcript, &tx_path).expect("write transcript into missing parent dirs");
+        let round_tripped = read_transcript(&tx_path).expect("read back written transcript");
+        assert_eq!(round_tripped.len(), transcript.len());
+        assert_eq!(round_tripped.circuit, transcript.circuit);
     }
 }
