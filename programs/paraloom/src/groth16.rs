@@ -46,7 +46,13 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
         public_inputs: &'a [[u8; 32]; NR_INPUTS],
         verifyingkey: &'a Groth16Verifyingkey<'a>,
     ) -> Result<Groth16Verifier<'a, NR_INPUTS>, Groth16Error> {
-        if public_inputs.len() + 1 != verifyingkey.vk_ic.len() {
+        // `prepare_inputs` indexes `vk_ic[0]` directly, so an empty IC vector
+        // would panic; `nr_pubinputs` must agree with the supplied inputs and
+        // with the IC length, or verification silently binds the wrong key (#1383).
+        if verifyingkey.vk_ic.is_empty()
+            || verifyingkey.nr_pubinputs != public_inputs.len()
+            || public_inputs.len().checked_add(1) != Some(verifyingkey.vk_ic.len())
+        {
             return Err(Groth16Error::InvalidPublicInputsLength);
         }
         Ok(Groth16Verifier {
@@ -102,4 +108,51 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
 
 fn is_less_than_bn254_field_size_be(bytes: &[u8; 32]) -> bool {
     BigUint::from_bytes_be(bytes) < Fr::MODULUS.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verifier_new_rejects_inconsistent_verifying_key() {
+        let a = [0u8; 64];
+        let b = [0u8; 128];
+        let c = [0u8; 64];
+        let inputs: [[u8; 32]; 2] = [[0u8; 32]; 2];
+        let ic: Vec<[u8; 64]> = vec![[0u8; 64]; 3];
+
+        // Empty IC vector: prepare_inputs would index vk_ic[0] and panic (#1383).
+        let empty_vk = Groth16Verifyingkey {
+            nr_pubinputs: 0,
+            vk_alpha_g1: a,
+            vk_beta_g2: b,
+            vk_gamme_g2: b,
+            vk_delta_g2: b,
+            vk_ic: &[],
+        };
+        assert!(Groth16Verifier::new(&a, &b, &c, &inputs, &empty_vk).is_err());
+
+        // nr_pubinputs disagreeing with the supplied inputs (#1383).
+        let mismatched_vk = Groth16Verifyingkey {
+            nr_pubinputs: 1,
+            vk_alpha_g1: a,
+            vk_beta_g2: b,
+            vk_gamme_g2: b,
+            vk_delta_g2: b,
+            vk_ic: &ic,
+        };
+        assert!(Groth16Verifier::new(&a, &b, &c, &inputs, &mismatched_vk).is_err());
+
+        // Consistent key (2 inputs, nr_pubinputs 2, 3 IC points) is accepted.
+        let good_vk = Groth16Verifyingkey {
+            nr_pubinputs: 2,
+            vk_alpha_g1: a,
+            vk_beta_g2: b,
+            vk_gamme_g2: b,
+            vk_delta_g2: b,
+            vk_ic: &ic,
+        };
+        assert!(Groth16Verifier::new(&a, &b, &c, &inputs, &good_vk).is_ok());
+    }
 }

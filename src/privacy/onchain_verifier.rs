@@ -118,7 +118,13 @@ pub fn compressed_proof_to_onchain_bytes(
     compressed: &[u8],
 ) -> Result<[u8; 256], ark_serialize::SerializationError> {
     use ark_serialize::CanonicalDeserialize;
-    let proof = Proof::<ark_bn254::Bn254>::deserialize_compressed(compressed)?;
+    // Deserialize through a mutable cursor and reject trailing bytes: the
+    // plain slice form silently ignored anything past the 128-byte proof (#1383).
+    let mut cursor = compressed;
+    let proof = Proof::<ark_bn254::Bn254>::deserialize_compressed(&mut cursor)?;
+    if !cursor.is_empty() {
+        return Err(ark_serialize::SerializationError::InvalidData);
+    }
     Ok(proof_to_onchain_bytes(&proof))
 }
 
@@ -212,7 +218,13 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
         public_inputs: &'a [[u8; 32]; NR_INPUTS],
         verifyingkey: &'a Groth16Verifyingkey<'a>,
     ) -> Result<Groth16Verifier<'a, NR_INPUTS>, Groth16Error> {
-        if public_inputs.len() + 1 != verifyingkey.vk_ic.len() {
+        // `prepare_inputs` indexes `vk_ic[0]` directly, so an empty IC vector
+        // would panic; `nr_pubinputs` must agree with the supplied inputs and
+        // with the IC length, or verification silently binds the wrong key (#1383).
+        if verifyingkey.vk_ic.is_empty()
+            || verifyingkey.nr_pubinputs != public_inputs.len()
+            || public_inputs.len().checked_add(1) != Some(verifyingkey.vk_ic.len())
+        {
             return Err(Groth16Error::InvalidPublicInputsLength);
         }
         Ok(Groth16Verifier {
@@ -356,6 +368,28 @@ mod tests {
         let wire_vk = WireVerifyingKey::from_arkworks(&vk);
         let vk_view = wire_vk.as_verifying_key();
 
+        // The compressed-proof boundary must round-trip cleanly and reject
+        // trailing bytes appended to the 128-byte proof (#1383).
+        use ark_serialize::CanonicalSerialize;
+        let mut compressed = Vec::new();
+        proof
+            .serialize_compressed(&mut compressed)
+            .expect("proof serializes compressed");
+        assert_eq!(compressed.len(), 128, "compressed BN254 proof is 128 bytes");
+        let onchain = compressed_proof_to_onchain_bytes(&compressed)
+            .expect("clean compressed proof must convert");
+        assert_eq!(onchain, proof_to_onchain_bytes(&proof));
+        let mut trailing = compressed.clone();
+        trailing.push(0x00);
+        assert!(
+            compressed_proof_to_onchain_bytes(&trailing).is_err(),
+            "trailing bytes after a compressed proof must be rejected"
+        );
+        assert!(
+            compressed_proof_to_onchain_bytes(&[]).is_err(),
+            "an empty compressed proof must be rejected"
+        );
+
         assert_eq!(wire_vk.ic.len(), 6, "withdraw v2 VK must have 6 IC points");
         assert!(
             verify(&wire_proof, &public_inputs, &vk_view),
@@ -377,6 +411,60 @@ mod tests {
             !verify(&wire_proof, &bad_dest, &vk_view),
             "a proof bound to one ext_data_hash must not verify against another"
         );
+    }
+
+    #[test]
+    fn verifier_new_rejects_inconsistent_verifying_key() {
+        let a = [0u8; 64];
+        let b = [0u8; 128];
+        let c = [0u8; 64];
+        let inputs: [[u8; 32]; 5] = [[0u8; 32]; 5];
+        let ic: Vec<[u8; 64]> = vec![[0u8; 64]; 6];
+
+        // Empty IC vector: prepare_inputs would index vk_ic[0] and panic (#1383).
+        let empty_vk = Groth16Verifyingkey {
+            nr_pubinputs: 0,
+            vk_alpha_g1: a,
+            vk_beta_g2: b,
+            vk_gamme_g2: b,
+            vk_delta_g2: b,
+            vk_ic: &[],
+        };
+        assert!(Groth16Verifier::new(&a, &b, &c, &inputs, &empty_vk).is_err());
+
+        // nr_pubinputs disagreeing with the supplied inputs (#1383).
+        let mismatched_vk = Groth16Verifyingkey {
+            nr_pubinputs: 4,
+            vk_alpha_g1: a,
+            vk_beta_g2: b,
+            vk_gamme_g2: b,
+            vk_delta_g2: b,
+            vk_ic: &ic,
+        };
+        assert!(Groth16Verifier::new(&a, &b, &c, &inputs, &mismatched_vk).is_err());
+
+        // IC length not equal to inputs + 1 (#1383).
+        let short_ic: Vec<[u8; 64]> = vec![[0u8; 64]; 5];
+        let short_vk = Groth16Verifyingkey {
+            nr_pubinputs: 5,
+            vk_alpha_g1: a,
+            vk_beta_g2: b,
+            vk_gamme_g2: b,
+            vk_delta_g2: b,
+            vk_ic: &short_ic,
+        };
+        assert!(Groth16Verifier::new(&a, &b, &c, &inputs, &short_vk).is_err());
+
+        // Consistent key (5 inputs, nr_pubinputs 5, 6 IC points) is accepted.
+        let good_vk = Groth16Verifyingkey {
+            nr_pubinputs: 5,
+            vk_alpha_g1: a,
+            vk_beta_g2: b,
+            vk_gamme_g2: b,
+            vk_delta_g2: b,
+            vk_ic: &ic,
+        };
+        assert!(Groth16Verifier::new(&a, &b, &c, &inputs, &good_vk).is_ok());
     }
 
     /// Dev tool — regenerates the on-chain program's withdraw verifying-key
