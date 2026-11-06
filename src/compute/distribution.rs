@@ -62,60 +62,57 @@ pub struct JobAssignment {
     pub retry_count: u32, // Number of times this job has been retried
 }
 
+/// Current Unix time in seconds. A clock set before the Unix epoch
+/// yields 0 instead of panicking on `duration_since(UNIX_EPOCH)`
+/// (#1375, mirroring #83 / #754).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl JobAssignment {
     pub fn new(job_id: JobId, validator_id: ValidatorId) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = now_unix_secs();
 
         Self {
             job_id,
             validator_id,
             assigned_at: now,
-            timeout_at: now + DEFAULT_JOB_TIMEOUT_SECS,
+            timeout_at: now.saturating_add(DEFAULT_JOB_TIMEOUT_SECS),
             retry_count: 0,
         }
     }
 
     /// Create assignment with custom timeout
     pub fn with_timeout(job_id: JobId, validator_id: ValidatorId, timeout_secs: u64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = now_unix_secs();
 
         Self {
             job_id,
             validator_id,
             assigned_at: now,
-            timeout_at: now + timeout_secs,
+            timeout_at: now.saturating_add(timeout_secs),
             retry_count: 0,
         }
     }
 
     /// Check if this assignment has timed out
     pub fn is_timed_out(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        now >= self.timeout_at
+        now_unix_secs() >= self.timeout_at
     }
 
     /// Increment retry count and create new assignment
     pub fn retry(&self, new_validator_id: ValidatorId) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = now_unix_secs();
 
         Self {
             job_id: self.job_id.clone(),
             validator_id: new_validator_id,
             assigned_at: now,
-            timeout_at: now + DEFAULT_JOB_TIMEOUT_SECS,
-            retry_count: self.retry_count + 1,
+            timeout_at: now.saturating_add(DEFAULT_JOB_TIMEOUT_SECS),
+            retry_count: self.retry_count.saturating_add(1),
         }
     }
 }
@@ -590,7 +587,7 @@ impl JobCoordinator {
         let mut timed_out_jobs = 0;
 
         for assignment in pending.values().chain(active.values()) {
-            total_retries += assignment.retry_count as u64;
+            total_retries = total_retries.saturating_add(assignment.retry_count as u64);
 
             if assignment.retry_count >= MAX_JOB_RETRIES {
                 jobs_at_max_retries += 1;
@@ -614,8 +611,14 @@ impl JobCoordinator {
                 .values()
                 .filter(|v| v.available_capacity() > 0)
                 .count(),
-            total_capacity: validators.values().map(|v| v.max_concurrent_jobs).sum(),
-            current_load: validators.values().map(|v| v.current_load).sum(),
+            total_capacity: validators
+                .values()
+                .map(|v| v.max_concurrent_jobs)
+                .fold(0usize, usize::saturating_add),
+            current_load: validators
+                .values()
+                .map(|v| v.current_load)
+                .fold(0usize, usize::saturating_add),
             pending_assignments: pending.len(),
             active_assignments: active.len(),
             total_assignments: total_jobs,
@@ -678,6 +681,42 @@ impl ValidatorJobFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_assignment_timeout_overflow_saturates() {
+        // #1375: a huge timeout_secs must saturate, not panic on
+        // overflow (overflow-checks are on in release builds).
+        let assignment = JobAssignment::with_timeout("job1".to_string(), "v1".to_string(), u64::MAX);
+        assert_eq!(assignment.timeout_at, u64::MAX);
+        assert!(!assignment.is_timed_out());
+
+        // retry() saturates the retry counter instead of overflowing.
+        let mut maxed = JobAssignment::new("job1".to_string(), "v1".to_string());
+        maxed.retry_count = u32::MAX;
+        let retried = maxed.retry("v2".to_string());
+        assert_eq!(retried.retry_count, u32::MAX);
+        assert_eq!(retried.timeout_at, retried.assigned_at.saturating_add(DEFAULT_JOB_TIMEOUT_SECS));
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_stats_saturate_on_extreme_capacity() {
+        // #1375: a peer announcing an extreme capacity must not make
+        // get_stats overflow.
+        let coordinator = JobCoordinator::new();
+
+        let capacity1 = ValidatorCapacity::new("v1".to_string(), 4, 8192, usize::MAX);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(capacity1, usize::MAX))
+            .await;
+        let capacity2 = ValidatorCapacity::new("v2".to_string(), 4, 8192, usize::MAX);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(capacity2, usize::MAX))
+            .await;
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.total_capacity, usize::MAX);
+        assert_eq!(stats.current_load, usize::MAX);
+    }
 
     #[tokio::test]
     async fn test_coordinator_creation() {

@@ -47,6 +47,7 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
+use anyhow::{anyhow, Result};
 use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{Proof, ProvingKey, VerifyingKey};
@@ -136,6 +137,12 @@ impl ComputeCircuit {
     /// circuit; passing them as separate arguments lets the verifier
     /// recompute the public inputs from the same helpers without
     /// running the full constraint system.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either payload exceeds [`MAX_DATA_SIZE`]. Prefer
+    /// [`ComputeCircuit::try_with_witness`] (#1375), which returns a
+    /// typed error instead of crashing the worker thread.
     #[allow(clippy::too_many_arguments)]
     pub fn with_witness(
         code_hash: [u8; 32],
@@ -149,10 +156,55 @@ impl ComputeCircuit {
         owner_address: [u8; 32],
         spending_key: [u8; 32],
     ) -> Self {
-        assert!(input_data.len() <= MAX_DATA_SIZE, "Input data too large");
-        assert!(output_data.len() <= MAX_DATA_SIZE, "Output data too large");
+        Self::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            input_data,
+            input_randomness,
+            output_data,
+            output_randomness,
+            owner_address,
+            spending_key,
+        )
+        .expect("ComputeCircuit::with_witness: payload exceeds MAX_DATA_SIZE")
+    }
 
-        Self {
+    /// Fallible version of [`ComputeCircuit::with_witness`]: validates
+    /// both payloads against [`MAX_DATA_SIZE`] and returns a descriptive
+    /// error instead of panicking (#1375). A WASM job whose output is
+    /// between 1,025 and `MAX_WASM_OUTPUT_SIZE` (65,536) bytes must fail
+    /// here with `Err`, not crash the worker thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_with_witness(
+        code_hash: [u8; 32],
+        input_commitment: Fr,
+        output_commitment: Fr,
+        input_nullifier: Fr,
+        input_data: Vec<u8>,
+        input_randomness: [u8; 32],
+        output_data: Vec<u8>,
+        output_randomness: [u8; 32],
+        owner_address: [u8; 32],
+        spending_key: [u8; 32],
+    ) -> Result<Self> {
+        if input_data.len() > MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Input data too large: {} bytes exceeds MAX_DATA_SIZE ({})",
+                input_data.len(),
+                MAX_DATA_SIZE
+            ));
+        }
+        if output_data.len() > MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Output data too large: {} bytes exceeds MAX_DATA_SIZE ({})",
+                output_data.len(),
+                MAX_DATA_SIZE
+            ));
+        }
+
+        Ok(Self {
             code_hash: Some(code_hash),
             input_commitment: Some(input_commitment),
             output_commitment: Some(output_commitment),
@@ -163,7 +215,7 @@ impl ComputeCircuit {
             output_randomness: Some(output_randomness),
             owner_address: Some(owner_address),
             spending_key: Some(spending_key),
-        }
+        })
     }
 
     /// Hash data to a field element via SHA-256 reduced mod the BN254
@@ -395,6 +447,68 @@ mod tests {
         assert_eq!(circuit.input_data.unwrap(), vec![1, 2, 3, 4]);
         assert!(circuit.input_nullifier.is_some());
         assert!(circuit.owner_address.is_some());
+    }
+
+    #[test]
+    fn test_try_with_witness_rejects_oversized_payloads() {
+        // #1375: payloads above MAX_DATA_SIZE must return Err, not panic.
+        let code_hash = [1u8; 32];
+        let input_commitment = Fr::from(12345u64);
+        let output_commitment = Fr::from(67890u64);
+        let input_nullifier = Fr::from(54321u64);
+
+        // Oversized input.
+        let err = match ComputeCircuit::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            vec![0u8; MAX_DATA_SIZE + 1],
+            [42u8; 32],
+            vec![5, 6, 7, 8],
+            [99u8; 32],
+            [7u8; 32],
+            [8u8; 32],
+        ) {
+            Ok(_) => panic!("oversized input must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Input data too large"));
+
+        // Oversized output (e.g. a WASM output between 1,025 and 65,536 bytes).
+        let err = match ComputeCircuit::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            vec![1, 2, 3, 4],
+            [42u8; 32],
+            vec![0u8; MAX_DATA_SIZE + 1],
+            [99u8; 32],
+            [7u8; 32],
+            [8u8; 32],
+        ) {
+            Ok(_) => panic!("oversized output must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Output data too large"));
+
+        // Exactly MAX_DATA_SIZE on both sides is accepted.
+        let circuit = ComputeCircuit::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            vec![0u8; MAX_DATA_SIZE],
+            [42u8; 32],
+            vec![0u8; MAX_DATA_SIZE],
+            [99u8; 32],
+            [7u8; 32],
+            [8u8; 32],
+        )
+        .expect("payloads at MAX_DATA_SIZE must be accepted");
+        assert_eq!(circuit.input_data.unwrap().len(), MAX_DATA_SIZE);
+        assert_eq!(circuit.output_data.unwrap().len(), MAX_DATA_SIZE);
     }
 
     /// Cross-circuit consistency: the in-circuit Poseidon commitment

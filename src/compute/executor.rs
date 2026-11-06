@@ -267,19 +267,31 @@ impl JobExecutor {
             match result.status {
                 JobStatus::Completed => {
                     completed_count += 1;
-                    total_exec_time += result.execution_time_ms;
-                    total_memory += result.memory_used_bytes;
-                    total_instructions += result.instructions_executed;
+                    total_exec_time = total_exec_time.saturating_add(result.execution_time_ms);
+                    total_memory = total_memory.saturating_add(result.memory_used_bytes);
+                    total_instructions =
+                        total_instructions.saturating_add(result.instructions_executed);
                 }
-                JobStatus::Failed { .. } => {
+                // Failed and timed-out jobs consumed execution time,
+                // memory, and instructions too (#1375): count them in
+                // failed_jobs and include their metrics in the totals
+                // instead of silently dropping them.
+                JobStatus::Failed { .. } | JobStatus::TimedOut => {
                     failed_count += 1;
+                    total_exec_time = total_exec_time.saturating_add(result.execution_time_ms);
+                    total_memory = total_memory.saturating_add(result.memory_used_bytes);
+                    total_instructions =
+                        total_instructions.saturating_add(result.instructions_executed);
                 }
                 _ => {}
             }
         }
 
-        let avg_exec_time = if completed_count > 0 {
-            total_exec_time / completed_count as u64
+        // Average over every finished job whose time is counted in the
+        // total (completed + failed + timed-out), not just completions.
+        let finished_count = completed_count + failed_count;
+        let avg_exec_time = if finished_count > 0 {
+            total_exec_time / finished_count as u64
         } else {
             0
         };
@@ -350,6 +362,60 @@ mod tests {
 
         let status = executor.get_job_status(&job_id);
         assert_eq!(status, Some(JobStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn test_executor_stats_counts_timed_out_and_failed_metrics() {
+        // #1375: TimedOut results must count in failed_jobs, and the
+        // execution metrics of failed / timed-out jobs must be included
+        // in the totals instead of silently dropped.
+        let executor = JobExecutor::new().unwrap();
+
+        let completed = JobResult {
+            job_id: "job-completed".to_string(),
+            status: JobStatus::Completed,
+            output_data: Some(vec![1]),
+            error: None,
+            execution_time_ms: 100,
+            memory_used_bytes: 1000,
+            instructions_executed: 100,
+        };
+        let failed = JobResult {
+            job_id: "job-failed".to_string(),
+            status: JobStatus::Failed {
+                error: "boom".to_string(),
+            },
+            output_data: None,
+            error: Some("boom".to_string()),
+            execution_time_ms: 50,
+            memory_used_bytes: 500,
+            instructions_executed: 50,
+        };
+        let timed_out = JobResult {
+            job_id: "job-timed-out".to_string(),
+            status: JobStatus::TimedOut,
+            output_data: None,
+            error: None,
+            execution_time_ms: 200,
+            memory_used_bytes: 2000,
+            instructions_executed: 200,
+        };
+
+        {
+            let mut results = executor.completed_results.lock().unwrap();
+            results.insert(completed.job_id.clone(), completed);
+            results.insert(failed.job_id.clone(), failed);
+            results.insert(timed_out.job_id.clone(), timed_out);
+        }
+
+        let stats = executor.get_stats();
+        assert_eq!(stats.completed_jobs, 1);
+        assert_eq!(stats.failed_jobs, 2);
+        assert_eq!(stats.total_execution_time_ms, 350);
+        assert_eq!(stats.total_memory_used_bytes, 3500);
+        assert_eq!(stats.total_instructions_executed, 350);
+        // Average is over all finished jobs: 350 ms / 3 jobs = 116.
+        assert_eq!(stats.average_execution_time_ms, 116);
     }
 
     #[tokio::test]

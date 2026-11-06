@@ -80,6 +80,18 @@ impl PrivateComputeJob {
     ) -> Result<Self> {
         use sha2::{Digest, Sha256};
 
+        // Reject inputs the proving circuit cannot witness (#1375):
+        // ComputeCircuit::with_witness panics above MAX_DATA_SIZE
+        // (1,024 bytes), so an oversized job must fail here with a
+        // typed error instead of crashing the worker at proof time.
+        if input_data.len() > crate::compute::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Input data too large: {} bytes exceeds MAX_DATA_SIZE ({}) for ComputeCircuit",
+                input_data.len(),
+                crate::compute::MAX_DATA_SIZE
+            ));
+        }
+
         // Compute code hash
         let code_hash: [u8; 32] = Sha256::digest(&wasm_code).into();
 
@@ -200,6 +212,18 @@ impl PrivateJobResult {
         let output_data = result
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
+
+        // Reject outputs the proving circuit cannot witness (#1375):
+        // WASM outputs may be up to MAX_WASM_OUTPUT_SIZE (65,536) bytes
+        // while the circuit caps at MAX_DATA_SIZE (1,024); an oversized
+        // output must fail here, not panic inside with_witness.
+        if output_data.len() > crate::compute::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Output data too large: {} bytes exceeds MAX_DATA_SIZE ({}) for ComputeCircuit",
+                output_data.len(),
+                crate::compute::MAX_DATA_SIZE
+            ));
+        }
 
         // Create commitment to output
         let data_hash = PrivateComputeJob::hash_data(&output_data);
@@ -324,7 +348,7 @@ impl PrivateJobResult {
                 &dummy_spending_key,
             );
 
-            let circuit = crate::compute::ComputeCircuit::with_witness(
+            let circuit = crate::compute::ComputeCircuit::try_with_witness(
                 dummy_code_hash,
                 dummy_input_commitment_fr,
                 output_commitment_fr,
@@ -335,7 +359,7 @@ impl PrivateJobResult {
                 *randomness,
                 dummy_owner,
                 dummy_spending_key,
-            );
+            )?;
 
             // Generate proof
             use ark_groth16::Groth16;
@@ -634,6 +658,47 @@ mod tests {
         let job = job.unwrap();
         assert!(!job.encrypted_input.is_empty());
         assert_ne!(job.code_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_private_job_rejects_oversized_input() {
+        // #1375: inputs above MAX_DATA_SIZE must fail at construction
+        // with a typed error, not panic later inside with_witness.
+        let wasm_code = vec![0x00, 0x61, 0x73, 0x6d];
+        let owner_address = ShieldedAddress([42u8; 32]);
+        let limits = ResourceLimits::default();
+
+        let oversized = vec![0u8; crate::compute::MAX_DATA_SIZE + 1];
+        let err = PrivateComputeJob::new(wasm_code.clone(), oversized, owner_address.clone(), limits.clone())
+            .unwrap_err();
+        assert!(err.to_string().contains("Input data too large"));
+
+        // Exactly MAX_DATA_SIZE is accepted.
+        let at_limit = vec![0u8; crate::compute::MAX_DATA_SIZE];
+        assert!(PrivateComputeJob::new(wasm_code, at_limit, owner_address, limits).is_ok());
+    }
+
+    #[test]
+    fn test_from_job_result_rejects_oversized_output() {
+        // #1375: a WASM output above MAX_DATA_SIZE must fail here,
+        // not panic in generate_execution_proof / with_witness.
+        use crate::compute::JobResult;
+
+        let job_id = "test-oversized-output".to_string();
+        let job_result = JobResult {
+            job_id: job_id.clone(),
+            status: crate::compute::JobStatus::Completed,
+            output_data: Some(vec![0u8; crate::compute::MAX_DATA_SIZE + 1]),
+            error: None,
+            execution_time_ms: 100,
+            memory_used_bytes: 1024,
+            instructions_executed: 50000,
+        };
+
+        let owner_address = ShieldedAddress([42u8; 32]);
+        let err =
+            PrivateJobResult::from_job_result(job_id, job_result, &owner_address).unwrap_err();
+        assert!(err.to_string().contains("Output data too large"));
     }
 
     /// X25519 keypair for the confidential-compute tests: the public key is the

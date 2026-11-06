@@ -293,7 +293,12 @@ impl VerificationCoordinator {
                 .filter_map(|r| r.result.output_data.as_ref().cloned())
                 .collect();
 
+            // All validators failed (no output at all) is a disagreement,
+            // not a round that vanishes from the accounting (#1375):
+            // without this, agreements + disagreements + insufficient <
+            // results.len() for all-failed rounds.
             if output_hashes.is_empty() {
+                consensus_disagreements += 1;
                 continue;
             }
 
@@ -311,8 +316,18 @@ impl VerificationCoordinator {
             }
         }
 
+        // Average only over jobs that still have an active verification
+        // request (#1375): orphaned results entries (job_id no longer in
+        // requests) must not inflate the numerator, and an empty
+        // requests map with leftover results must not report 0.0 for a
+        // non-empty result set.
         let avg_validators = if !requests.is_empty() {
-            results.values().map(|v| v.len()).sum::<usize>() as f64 / requests.len() as f64
+            results
+                .iter()
+                .filter(|(job_id, _)| requests.contains_key(*job_id))
+                .map(|(_, v)| v.len())
+                .sum::<usize>() as f64
+                / requests.len() as f64
         } else {
             0.0
         };
@@ -348,6 +363,106 @@ pub struct VerificationStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_stats_counts_all_failed_round_as_disagreement() {
+        // #1375: when >= CONSENSUS_THRESHOLD validators all fail (no
+        // output_data), the round must count as a disagreement instead
+        // of vanishing from the agreement/disagreement/insufficient
+        // accounting.
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job-all-failed".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        for v in ["v1", "v2", "v3"] {
+            let result = JobResult::failure(job_id.clone(), "validator crashed".to_string(), 10);
+            coordinator
+                .submit_result(&job_id, v.to_string(), result)
+                .await
+                .unwrap();
+        }
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.consensus_agreements, 0);
+        assert_eq!(stats.consensus_disagreements, 1);
+        assert_eq!(stats.insufficient_results, 0);
+        assert_eq!(
+            stats.consensus_agreements + stats.consensus_disagreements + stats.insufficient_results,
+            1,
+            "every round with >= threshold results must be accounted for"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stats_average_ignores_orphaned_results() {
+        // #1375: average_validators_per_job must be computed over
+        // active requests only; orphaned results (job_id no longer in
+        // requests) must not inflate it.
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job1".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+        for v in ["v1", "v2"] {
+            let result = JobResult::success(job_id.clone(), vec![42], 100, 1024, 50000);
+            coordinator
+                .submit_result(&job_id, v.to_string(), result)
+                .await
+                .unwrap();
+        }
+        // Second active request with no results yet.
+        coordinator
+            .create_verification_request(
+                "job2".to_string(),
+                vec!["v1".to_string(), "v2".to_string(), "v3".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Orphaned results for a job with no active request.
+        {
+            let mut results = coordinator.results.write().await;
+            results.insert(
+                "orphan-job".to_string(),
+                vec![
+                    ValidatorResult::new(
+                        "v1".to_string(),
+                        JobResult::success("orphan-job".to_string(), vec![1], 1, 1, 1),
+                    ),
+                    ValidatorResult::new(
+                        "v1".to_string(),
+                        JobResult::success("orphan-job".to_string(), vec![1], 1, 1, 1),
+                    ),
+                    ValidatorResult::new(
+                        "v1".to_string(),
+                        JobResult::success("orphan-job".to_string(), vec![1], 1, 1, 1),
+                    ),
+                    ValidatorResult::new(
+                        "v1".to_string(),
+                        JobResult::success("orphan-job".to_string(), vec![1], 1, 1, 1),
+                    ),
+                    ValidatorResult::new(
+                        "v1".to_string(),
+                        JobResult::success("orphan-job".to_string(), vec![1], 1, 1, 1),
+                    ),
+                ],
+            );
+        }
+
+        let stats = coordinator.get_stats().await;
+        // (2 results for job1 + 0 for job2) / 2 active requests = 1.0,
+        // not (2 + 5) / 2 = 3.5.
+        assert_eq!(stats.average_validators_per_job, 1.0);
+        assert_eq!(stats.total_results_collected, 7);
+    }
 
     #[tokio::test]
     async fn test_verification_coordinator_creation() {
