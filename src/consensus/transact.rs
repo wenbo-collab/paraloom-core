@@ -608,6 +608,40 @@ impl TransactVerificationCoordinator {
             }
         }
 
+        // Duplicate-wallet Sybil guard (#1484): a new NodeId claiming a wallet
+        // already claimed by another NodeId evicts the stale entry, so one
+        // wallet can never inflate `validator_count()` or the leader-selection
+        // weight by re-registering under fresh NodeIds. The leader selector
+        // evicts its own entry on register/update below; the `validators`
+        // Vec is pruned here so the two stay in sync. A wallet-less
+        // registration (reconnect without an advertised wallet) evicts
+        // nothing.
+        if let Some(wallet) = &wallet_pubkey {
+            let current: Vec<NodeId> = self.validators.read().await.clone();
+            let stale: Vec<NodeId> = {
+                let leader_selector = self.leader_selector.read().await;
+                current
+                    .into_iter()
+                    .filter(|v| {
+                        *v != validator
+                            && leader_selector
+                                .get_validator(v)
+                                .and_then(|info| info.wallet_pubkey.as_ref())
+                                == Some(wallet)
+                    })
+                    .collect()
+            };
+            if !stale.is_empty() {
+                let mut validators = self.validators.write().await;
+                validators.retain(|v| !stale.contains(v));
+                log::info!(
+                    "Evicted stale transact validator(s) {:?} claiming duplicate wallet {}",
+                    stale,
+                    wallet
+                );
+            }
+        }
+
         let mut validators = self.validators.write().await;
         if !validators.contains(&validator) {
             log::info!(
@@ -1088,6 +1122,28 @@ mod tests {
         )
         .await;
         (c, rx)
+    }
+
+    #[tokio::test]
+    async fn duplicate_wallet_registration_evicts_stale_validator() {
+        // One wallet registered under two NodeIds must count once (#1484):
+        // the second registration evicts the stale NodeId from the
+        // validator set, so `validator_count()` is not inflated by
+        // duplicate-wallet entries that cannot cast distinct votes.
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("WALLET".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("WALLET".to_string()))
+            .await;
+        assert_eq!(coordinator.validator_count().await, 1);
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![2])).await);
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![2])).await,
+            Some("WALLET".to_string())
+        );
     }
 
     #[tokio::test]

@@ -254,6 +254,30 @@ impl JobCoordinator {
         Ok(())
     }
 
+    /// Look up the assignment (pending or active) for a job, if any.
+    /// Lets the node bind an inbound `ComputeJobResponse` / `ComputeJobResult`
+    /// to the validator it actually dispatched the job to (#1484).
+    pub async fn get_assignment(&self, job_id: &JobId) -> Option<JobAssignment> {
+        if let Some(assignment) = self.pending_assignments.read().await.get(job_id) {
+            return Some(assignment.clone());
+        }
+        self.active_assignments.read().await.get(job_id).cloned()
+    }
+
+    /// Confirm an accepted assignment: move it from pending to active when
+    /// the assigned validator acknowledges the job (#1484). A no-op when the
+    /// job has no pending assignment (already confirmed, completed, or
+    /// unknown) — the caller has already decided the response is authentic.
+    pub async fn confirm_assignment(&self, job_id: &JobId) -> Result<()> {
+        self.mark_job_fetched(job_id).await
+    }
+
+    /// Complete a finished job: drop its assignment from both pending and
+    /// active tracking so the validator's load slot is freed (#1484).
+    pub async fn complete_job(&self, job_id: &JobId) -> Result<()> {
+        self.remove_assignment(job_id).await
+    }
+
     /// Get pending assignment for a validator
     pub async fn get_pending_jobs_for_validator(&self, validator_id: &ValidatorId) -> Vec<JobId> {
         let pending = self.pending_assignments.read().await;
@@ -778,6 +802,96 @@ mod tests {
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.pending_assignments, 0);
         assert_eq!(stats.active_assignments, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_assignment_returns_assigned_validator() {
+        let coordinator = JobCoordinator::new();
+
+        let capacity = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(capacity, 0))
+            .await;
+
+        // Unknown job: no assignment.
+        assert!(coordinator.get_assignment(&"nope".to_string()).await.is_none());
+
+        let job_id = "job1".to_string();
+        coordinator.assign_job(job_id.clone()).await.unwrap();
+
+        // Pending assignment is visible to the lookup.
+        let found = coordinator.get_assignment(&job_id).await.unwrap();
+        assert_eq!(found.validator_id, "v1");
+
+        // Still visible once active.
+        coordinator.mark_job_fetched(&job_id).await.unwrap();
+        let found = coordinator.get_assignment(&job_id).await.unwrap();
+        assert_eq!(found.validator_id, "v1");
+
+        // Gone once completed.
+        coordinator.complete_job(&job_id).await.unwrap();
+        assert!(coordinator.get_assignment(&job_id).await.is_none());
+    }
+
+    /// `confirm_assignment` (#1484) moves an accepted job from pending to
+    /// active so `handle_timeouts` stops treating it as unacknowledged.
+    #[tokio::test]
+    async fn test_confirm_assignment_moves_pending_to_active() {
+        let coordinator = JobCoordinator::new();
+
+        let capacity = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(capacity, 0))
+            .await;
+
+        let job_id = "job1".to_string();
+        coordinator.assign_job(job_id.clone()).await.unwrap();
+
+        coordinator.confirm_assignment(&job_id).await.unwrap();
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.pending_assignments, 0);
+        assert_eq!(stats.active_assignments, 1);
+
+        // Confirming again (or an unknown job) is a harmless no-op.
+        coordinator.confirm_assignment(&job_id).await.unwrap();
+        coordinator
+            .confirm_assignment(&"unknown".to_string())
+            .await
+            .unwrap();
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.active_assignments, 1);
+    }
+
+    /// `complete_job` (#1484) frees the assignment from both maps, whether
+    /// the job was still pending (never fetched) or already active.
+    #[tokio::test]
+    async fn test_complete_job_frees_pending_and_active() {
+        let coordinator = JobCoordinator::new();
+
+        let capacity = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(capacity, 0))
+            .await;
+
+        // Pending case.
+        coordinator.assign_job("job1".to_string()).await.unwrap();
+        coordinator.complete_job(&"job1".to_string()).await.unwrap();
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.pending_assignments, 0);
+        assert_eq!(stats.active_assignments, 0);
+
+        // Active case.
+        coordinator.assign_job("job2".to_string()).await.unwrap();
+        coordinator
+            .confirm_assignment(&"job2".to_string())
+            .await
+            .unwrap();
+        coordinator.complete_job(&"job2".to_string()).await.unwrap();
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.pending_assignments, 0);
+        assert_eq!(stats.active_assignments, 0);
+        assert_eq!(coordinator.get_validator_load(&"v1".to_string()).await, 0);
     }
 
     #[test]

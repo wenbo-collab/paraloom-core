@@ -84,8 +84,34 @@ impl LeaderSelector {
         }
     }
 
+    /// Evict any *other* validator claiming the same co-sign wallet, so one
+    /// wallet can never multiply its leader-selection weight by re-registering
+    /// under fresh `NodeId`s (#1484). A re-register of the same `NodeId`
+    /// keeps its entry; a wallet-less registration evicts nothing.
+    fn evict_stale_wallet_claimants(&mut self, node_id: &NodeId, wallet_pubkey: &Option<String>) {
+        if let Some(wallet) = wallet_pubkey {
+            let stale: Vec<NodeId> = self
+                .validators
+                .values()
+                .filter(|v| {
+                    v.node_id != *node_id && v.wallet_pubkey.as_deref() == Some(wallet.as_str())
+                })
+                .map(|v| v.node_id.clone())
+                .collect();
+            for id in stale {
+                self.validators.remove(&id);
+                log::info!(
+                    "Evicted stale validator {:?} claiming duplicate wallet {}",
+                    id,
+                    wallet
+                );
+            }
+        }
+    }
+
     /// Register a validator
     pub fn register_validator(&mut self, validator: ValidatorInfo) {
+        self.evict_stale_wallet_claimants(&validator.node_id, &validator.wallet_pubkey);
         log::info!(
             "Registering validator for leader selection: {:?} (stake: {}, reputation: {})",
             validator.node_id,
@@ -133,6 +159,7 @@ impl LeaderSelector {
 
     /// Update validator info
     pub fn update_validator(&mut self, validator: ValidatorInfo) {
+        self.evict_stale_wallet_claimants(&validator.node_id, &validator.wallet_pubkey);
         self.validators.insert(validator.node_id.clone(), validator);
     }
 
@@ -321,6 +348,72 @@ mod tests {
             0,
             "a validator with no wallet carries no stake weight"
         );
+    }
+
+    #[test]
+    fn duplicate_wallet_registration_evicts_stale_node() {
+        // Two distinct NodeIds claiming one wallet must not both carry its
+        // stake: the second registration evicts the first (#1484).
+        let mut sel = LeaderSelector::new();
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![1]), 5, 1000).with_wallet(Some("WALLET_A".to_string())),
+        );
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![2]), 5, 1000).with_wallet(Some("WALLET_A".to_string())),
+        );
+
+        assert!(sel.get_validator(&NodeId(vec![1])).is_none(), "stale claimant evicted");
+        assert!(sel.get_validator(&NodeId(vec![2])).is_some());
+        assert_eq!(sel.active_validator_count(), 1);
+
+        // The wallet's weight is counted once, not multiplied.
+        let mut onchain = HashMap::new();
+        onchain.insert("WALLET_A".to_string(), 7_000_000_000u64);
+        sel.apply_onchain_stakes(&onchain);
+        let total: u128 = sel
+            .get_validators_by_weight()
+            .iter()
+            .map(|v| v.selection_weight())
+            .sum();
+        assert_eq!(total, 7_000_000_000, "one wallet contributes its stake once");
+    }
+
+    #[test]
+    fn duplicate_wallet_update_evicts_stale_node() {
+        // Same eviction via the update path: a validator adopting an
+        // already-claimed wallet displaces the stale claimant (#1484).
+        let mut sel = LeaderSelector::new();
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![1]), 5, 1000).with_wallet(Some("WALLET_A".to_string())),
+        );
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![2]), 5, 1000).with_wallet(Some("WALLET_B".to_string())),
+        );
+        sel.update_validator(
+            ValidatorInfo::new(NodeId(vec![2]), 5, 1000).with_wallet(Some("WALLET_A".to_string())),
+        );
+
+        assert!(sel.get_validator(&NodeId(vec![1])).is_none(), "stale claimant evicted");
+        assert_eq!(
+            sel.get_validator(&NodeId(vec![2])).unwrap().wallet_pubkey.as_deref(),
+            Some("WALLET_A")
+        );
+        assert_eq!(sel.active_validator_count(), 1);
+    }
+
+    #[test]
+    fn same_node_reregister_keeps_its_entry() {
+        // Re-registering the SAME NodeId with the same wallet must not
+        // evict itself (#1484 guard against self-eviction).
+        let mut sel = LeaderSelector::new();
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![1]), 5, 1000).with_wallet(Some("WALLET_A".to_string())),
+        );
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![1]), 9, 2000).with_wallet(Some("WALLET_A".to_string())),
+        );
+        assert_eq!(sel.active_validator_count(), 1);
+        assert_eq!(sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount, 9);
     }
 
     #[test]

@@ -227,6 +227,19 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 info!("Received Pong from {}", source);
             }
             Message::Discovery { node_info } => {
+                // Reject a Discovery whose advertised id does not match the
+                // authenticated sender (#1484): a peer must not register a
+                // NodeInfo for an identity it does not hold, or downstream
+                // registration would trust a spoofed id.
+                if node_info.id != source {
+                    log::warn!(
+                        "Dropping Discovery from {} advertising mismatched node id {}",
+                        source,
+                        node_info.id
+                    );
+                    return Ok(());
+                }
+
                 info!("Discovered node {}: {:?}", source, node_info);
 
                 // If we're a coordinator, register this validator
@@ -432,13 +445,47 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     .await
                     .contains_key(&request.request_id);
 
+                // Double-spend pre-filter (#1484): reject a request whose
+                // input nullifier the local pool already recorded as spent
+                // BEFORE any Groth16 work or consensus round — a replayed or
+                // re-randomized proof for a settled spend must not burn a
+                // full verification, and a cached `Valid` for the same id is
+                // stale once the spend has landed, so it is invalidated
+                // rather than re-used. The on-chain nullifier PDAs remain
+                // the authoritative gate; this only keeps the off-chain
+                // filter in step (#624).
+                let spent_nullifier = if let Some(pool) = &self.shielded_pool {
+                    let mut spent = false;
+                    for nf in &request.nullifiers {
+                        if pool.is_spent(&crate::privacy::Nullifier(*nf)).await {
+                            spent = true;
+                            break;
+                        }
+                    }
+                    spent
+                } else {
+                    false
+                };
+
                 // Verify the transact zkSNARK proof, mirroring the transfer
                 // path (#350). Unlike a transfer, the v3 proof binds
                 // `request.root` directly (the on-chain incremental-tree root
                 // carried in the request), so verification needs no pool
                 // state; the pool gate below only keeps non-bridge nodes from
                 // voting on settlements they do not participate in.
-                let vote = if already_verified {
+                let vote = if spent_nullifier {
+                    self.verified_transacts
+                        .lock()
+                        .await
+                        .remove(&request.request_id);
+                    log::warn!(
+                        "Rejecting transact {}: input nullifier already spent",
+                        request.request_id
+                    );
+                    crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "nullifier already spent".to_string(),
+                    }
+                } else if already_verified {
                     info!(
                         "Transact {} already verified Valid; reusing cached result",
                         request.request_id
@@ -729,8 +776,63 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id, accepted, message
                 );
 
-                // If we have a manager (coordinator node), notify it
-                if let Some(_manager) = &self.compute_manager {
+                // Bind the response to the assignment this node dispatched
+                // (#1484): only the assigned validator may acknowledge, and
+                // the coordinator lifecycle must advance — an accepted job
+                // leaves pending for active, a rejected one is rolled back so
+                // its load slot frees instead of stranding until timeout. A
+                // response for an unknown job, or from a peer that was never
+                // assigned it, is dropped without touching coordinator state.
+                if let Some(coordinator) = &self.compute_coordinator {
+                    match coordinator.get_assignment(&job_id).await {
+                        Some(assignment)
+                            if assignment.validator_id == source.to_string() =>
+                        {
+                            if accepted {
+                                info!("Job {} was accepted by validator {}", job_id, source);
+                                if let Err(e) =
+                                    coordinator.confirm_assignment(&job_id).await
+                                {
+                                    log::error!(
+                                        "Failed to confirm assignment for job {}: {}",
+                                        job_id,
+                                        e
+                                    );
+                                }
+                            } else {
+                                log::warn!(
+                                    "Job {} was rejected by {}: {}; rolling back assignment",
+                                    job_id,
+                                    source,
+                                    message
+                                );
+                                if let Err(e) = coordinator.remove_assignment(&job_id).await {
+                                    log::error!(
+                                        "Failed to roll back rejected job {}: {}",
+                                        job_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Some(assignment) => {
+                            log::warn!(
+                                "Dropping ComputeJobResponse for job {} from {} \
+                                 (assigned to {})",
+                                job_id,
+                                source,
+                                assignment.validator_id
+                            );
+                        }
+                        None => {
+                            log::warn!(
+                                "Dropping ComputeJobResponse for unknown job {} from {}",
+                                job_id,
+                                source
+                            );
+                        }
+                    }
+                } else if let Some(_manager) = &self.compute_manager {
                     if accepted {
                         info!("Job {} was accepted by validator {}", job_id, source);
                         // Assignment tracking is handled by JobCoordinator
@@ -780,6 +882,43 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     "Received compute job result from {}: job_id={}, status={:?}",
                     source, job_id, status
                 );
+
+                // Only the validator assigned to this job may supply its
+                // result (#1484): an unauthenticated peer must not overwrite
+                // compute_storage or the manager with spoofed output. When
+                // this node tracks the job in a coordinator, a mismatched or
+                // unknown job is dropped before any state is written; a
+                // matching result completes the assignment first so the
+                // validator's load slot is freed.
+                if let Some(coordinator) = &self.compute_coordinator {
+                    match coordinator.get_assignment(&job_id).await {
+                        Some(assignment)
+                            if assignment.validator_id == source.to_string() =>
+                        {
+                            if let Err(e) = coordinator.complete_job(&job_id).await {
+                                log::error!("Failed to complete job {}: {}", job_id, e);
+                            }
+                        }
+                        Some(assignment) => {
+                            log::warn!(
+                                "Dropping ComputeJobResult for job {} from {} \
+                                 (assigned to {})",
+                                job_id,
+                                source,
+                                assignment.validator_id
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            log::warn!(
+                                "Dropping ComputeJobResult for unknown job {} from {}",
+                                job_id,
+                                source
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
 
                 // Store result and update job status
                 let result = crate::compute::JobResult {
@@ -2310,6 +2449,17 @@ impl Node {
             locally_valid
         };
 
+        // A locally-failed proof must not strand its round in
+        // `coordinator.pending` until the timeout sweep (#1484): our own
+        // verification has failed, so the round can never reach quorum —
+        // drop it now so a retried request starts with a fresh deadline
+        // instead of reusing this stale one.
+        if !locally_valid {
+            if let Err(e) = coordinator.cleanup(&request_id).await {
+                log::debug!("failed to drop failed transact round {request_id}: {e}");
+            }
+        }
+
         // Only broadcast a proof we ourselves verified as Valid. An invalid
         // submission to the ingress is already recorded as a local Invalid vote
         // and can never reach quorum, so broadcasting it would only let a flood
@@ -2687,8 +2837,9 @@ impl Node {
     /// built against `request.root` — the on-chain incremental-tree root
     /// carried in the request — and the root's legitimacy is enforced at
     /// settlement by the program's `is_known_root` check over its root
-    /// history. The method therefore needs no pool state at all, which is why
-    /// it takes no pool parameter.
+    /// history. The proof itself therefore needs no pool state. The pool IS
+    /// consulted for the spent-nullifier pre-filter (#1484) below: a proof
+    /// spending an already-settled nullifier fails before any Groth16 work.
     async fn verify_transact_proof(
         &self,
         request: &crate::consensus::transact::TransactVerificationRequest,
@@ -2696,6 +2847,25 @@ impl Node {
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
+        }
+
+        // Double-spend pre-filter (#1484): a proof spending a nullifier the
+        // local pool already recorded as spent fails before Groth16
+        // verification, so a replayed or re-randomized proof cannot burn a
+        // full verification or trigger a consensus round for a spend that
+        // can never settle. The on-chain nullifier PDAs remain the
+        // authoritative gate; this only keeps the off-chain filter in step
+        // (#624). (The test-only override above bypasses both.)
+        if let Some(pool) = &self.shielded_pool {
+            for nf in &request.nullifiers {
+                if pool.is_spent(&crate::privacy::Nullifier(*nf)).await {
+                    log::warn!(
+                        "transact proof rejected for {}: nullifier already spent",
+                        request.request_id
+                    );
+                    return Ok(false);
+                }
+            }
         }
 
         // Asset id: all-zero for native SOL, or `mint_to_asset(mint)` for an SPL
