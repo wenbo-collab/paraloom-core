@@ -15,6 +15,7 @@ use ark_ff::UniformRand;
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::{CryptoRng, RngCore};
+use sha2::Digest;
 
 use crate::types::NodeId;
 
@@ -113,6 +114,24 @@ pub fn read_pk(path: &Path) -> Result<ProvingKey<Bn254>, ContributeError> {
         .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))
 }
 
+/// SHA-512 of a proving key's canonical compressed serialisation.
+///
+/// This is the transcript anchor for the initial SRS: the finalize and
+/// verify CLIs hash the raw initial-key *file* bytes, and key files
+/// written by [`write_pk`] are exactly this serialisation, so the two
+/// agree for every key file this codebase produces. A first contribution
+/// anchored at anything else is rejected downstream with
+/// `initial_srs_hash mismatch`.
+pub fn hash_pk(pk: &ProvingKey<Bn254>) -> TranscriptHash {
+    let mut bytes = Vec::new();
+    pk.serialize_compressed(&mut bytes)
+        .expect("ProvingKey always serialises to its compressed form");
+    let digest = sha2::Sha512::digest(&bytes);
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&digest[..]);
+    out
+}
+
 /// Write a `ProvingKey<Bn254>` to a compressed-arkworks file.
 pub fn write_pk(pk: &ProvingKey<Bn254>, path: &Path) -> Result<(), ContributeError> {
     write_compressed(pk, path)
@@ -207,6 +226,25 @@ mod tests {
         assert_eq!(transcript.circuit, CircuitId::Deposit);
         assert_ne!(after_pk.delta_g1, initial_pk.delta_g1);
         verify_phase2_transcript(&initial_pk, &transcript).expect("transcript verifies");
+    }
+
+    #[test]
+    fn hash_pk_matches_the_key_file_bytes() {
+        // hash_pk must agree with the SHA-512 of the raw key file the
+        // finalize/verify CLIs compute: key files are exactly the
+        // canonical compressed serialisation hash_pk digests.
+        let pk = fresh_initial_pk();
+        let mut bytes = Vec::new();
+        pk.serialize_compressed(&mut bytes).unwrap();
+        let file_hash = sha2::Sha512::digest(&bytes);
+        assert_eq!(hash_pk(&pk)[..], file_hash[..]);
+        assert_eq!(hash_pk(&pk), hash_pk(&pk), "hash_pk is deterministic");
+
+        // A different key anchors a different transcript.
+        let mut other_rng = StdRng::seed_from_u64(0xBEEF_u64);
+        let (other_pk, _vk) =
+            Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut other_rng).unwrap();
+        assert_ne!(hash_pk(&pk), hash_pk(&other_pk));
     }
 
     #[test]

@@ -17,8 +17,8 @@
 
 use ark_bn254::{Bn254, Fr, G1Affine, G1Projective, G2Affine};
 use ark_ec::pairing::Pairing;
-use ark_ec::{CurveGroup, VariableBaseMSM};
-use ark_ff::{One, PrimeField};
+use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
+use ark_ff::{One, PrimeField, Zero};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use sha2::{Digest, Sha512};
@@ -64,6 +64,24 @@ pub enum VerifyError {
          the pairing consistency check failed"
     )]
     QueryInconsistent { field: &'static str },
+
+    #[error(
+        "delta `{field}` is the identity point, which trivialises every pairing \
+         in the consistency check"
+    )]
+    IdentityDelta { field: &'static str },
+
+    #[error(
+        "final key `delta_g1` was not scaled by the same δ as `vk.delta_g2`: \
+         the cross-group pairing check failed"
+    )]
+    DeltaG1Mismatch,
+
+    #[error(
+        "Fiat-Shamir challenge ρ is zero, collapsing the query-consistency \
+         combination to its first element"
+    )]
+    ZeroFiatShamirRho,
 }
 
 /// Verify a finalised phase-2 transcript end to end.
@@ -186,6 +204,46 @@ pub fn verify_final_pk_consistency(
     initial_pk: &ProvingKey<Bn254>,
     final_pk: &ProvingKey<Bn254>,
 ) -> Result<(), VerifyError> {
+    // 0. Identity deltas and an unbound delta_g1 trivialise the pairing
+    //    checks below, so reject them before any pairing runs.
+    //
+    //    An identity delta_g2 makes both sides of the query check pair
+    //    to 1 regardless of the vectors; an identity delta_g1 does the
+    //    same to the cross-group check. Either lets a corrupted key
+    //    pass as consistent.
+    if initial_pk.delta_g1.is_zero() {
+        return Err(VerifyError::IdentityDelta {
+            field: "initial_pk.delta_g1",
+        });
+    }
+    if initial_pk.vk.delta_g2.is_zero() {
+        return Err(VerifyError::IdentityDelta {
+            field: "initial_pk.vk.delta_g2",
+        });
+    }
+    if final_pk.delta_g1.is_zero() {
+        return Err(VerifyError::IdentityDelta {
+            field: "final_pk.delta_g1",
+        });
+    }
+    if final_pk.vk.delta_g2.is_zero() {
+        return Err(VerifyError::IdentityDelta {
+            field: "final_pk.vk.delta_g2",
+        });
+    }
+    // `delta_g1` and `vk.delta_g2` must carry the same δ: the query
+    // checks only bind the vectors to `delta_g2`, so a final key whose
+    // `delta_g1` was tampered (or never scaled) would otherwise pass
+    // while every Groth16 proof it generates is invalid. The pairing
+    // relation holds iff `final.delta_g1 = δ · initial.delta_g1` with
+    // the same δ that took `initial.delta_g2` to `final.delta_g2`:
+    // both sides collapse to `e(g1, g2)^(δ · δ₀)`.
+    let lhs = Bn254::pairing(final_pk.delta_g1, initial_pk.vk.delta_g2);
+    let rhs = Bn254::pairing(initial_pk.delta_g1, final_pk.vk.delta_g2);
+    if lhs != rhs {
+        return Err(VerifyError::DeltaG1Mismatch);
+    }
+
     // 1. Every δ-independent element must survive a contribution untouched.
     if final_pk.vk.alpha_g1 != initial_pk.vk.alpha_g1 {
         return Err(VerifyError::KeyElementAltered {
@@ -273,7 +331,7 @@ fn check_query_consistency(
         return Ok(());
     }
 
-    let rho = fiat_shamir_rho(field, initial, final_, initial_delta_g2, final_delta_g2);
+    let rho = fiat_shamir_rho(field, initial, final_, initial_delta_g2, final_delta_g2)?;
     let scalars = scalar_powers(rho, initial.len());
 
     // Σ ρ^j · P[j] over each vector. msm only errors on a length mismatch,
@@ -310,13 +368,17 @@ fn scalar_powers(base: Fr, n: usize) -> Vec<Fr> {
 /// vectors and both deltas means a malformed key cannot be crafted against a
 /// known combination: ρ depends on the very bytes the attacker would have to
 /// choose, leaving only a hash-grinding fixed point that is infeasible.
+///
+/// A zero challenge would collapse `scalar_powers` to `[1, 0, 0, …]`,
+/// reducing the batched check to its first element, so it is rejected
+/// rather than silently accepted.
 fn fiat_shamir_rho(
     domain: &str,
     initial: &[G1Affine],
     final_: &[G1Affine],
     initial_delta_g2: &G2Affine,
     final_delta_g2: &G2Affine,
-) -> Fr {
+) -> Result<Fr, VerifyError> {
     let mut hasher = Sha512::new();
     hasher.update(b"paraloom-ceremony-query-consistency-v1");
     hasher.update(domain.as_bytes());
@@ -329,7 +391,11 @@ fn fiat_shamir_rho(
         write_canonical(&mut hasher, point);
     }
     let digest = hasher.finalize();
-    Fr::from_le_bytes_mod_order(&digest[..])
+    let rho = Fr::from_le_bytes_mod_order(&digest[..]);
+    if rho.is_zero() {
+        return Err(VerifyError::ZeroFiatShamirRho);
+    }
+    Ok(rho)
 }
 
 fn write_canonical<T: CanonicalSerialize>(hasher: &mut Sha512, value: &T) {
@@ -524,6 +590,65 @@ mod tests {
         let (initial_pk, _transcript, final_pk) = build_real_transcript(3);
         verify_final_pk_consistency(&initial_pk, &final_pk)
             .expect("an honestly contributed key is δ⁻¹-consistent");
+    }
+
+    #[test]
+    fn tampered_delta_g1_is_rejected_by_cross_group_check() {
+        // delta_g2 untouched (verify_final_pk would still pass), but
+        // delta_g1 re-scaled by an unrelated scalar: every proof the
+        // key generates is invalid, and the cross-group pairing must
+        // catch it before the query checks run.
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(2);
+        let mut rng = StdRng::seed_from_u64(0x5EED_5EED_u64);
+        let bogus = Fr::rand(&mut rng);
+        final_pk.delta_g1 = (final_pk.delta_g1 * bogus).into_affine();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::DeltaG1Mismatch) => {}
+            other => panic!("expected DeltaG1Mismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn identity_final_delta_g2_is_rejected() {
+        // An identity delta_g2 pairs to 1 on both sides of the query
+        // check, so it would pass as "consistent" without the gate.
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(2);
+        final_pk.vk.delta_g2 = G2Affine::zero();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::IdentityDelta { field }) => {
+                assert_eq!(field, "final_pk.vk.delta_g2");
+            }
+            other => panic!("expected IdentityDelta(final_pk.vk.delta_g2), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn identity_initial_delta_g1_is_rejected() {
+        let (mut initial_pk, _transcript, final_pk) = build_real_transcript(1);
+        initial_pk.delta_g1 = G1Affine::zero();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::IdentityDelta { field }) => {
+                assert_eq!(field, "initial_pk.delta_g1");
+            }
+            other => panic!("expected IdentityDelta(initial_pk.delta_g1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fiat_shamir_rho_is_nonzero_for_real_keys() {
+        // The zero-ρ path is a defense-in-depth guard (hitting it would
+        // need a SHA-512 preimage); assert the honest case derives a
+        // usable non-zero challenge.
+        let (initial_pk, _transcript, final_pk) = build_real_transcript(1);
+        let rho = fiat_shamir_rho(
+            "h_query",
+            &initial_pk.h_query,
+            &final_pk.h_query,
+            &initial_pk.vk.delta_g2,
+            &final_pk.vk.delta_g2,
+        )
+        .expect("honest keys derive a challenge");
+        assert!(!rho.is_zero());
     }
 
     #[test]

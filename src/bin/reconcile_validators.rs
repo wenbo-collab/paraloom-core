@@ -85,12 +85,18 @@ struct ValidatorRow {
     stake_amount: u64,
 }
 
-fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
+fn decode(program_id: &Pubkey, pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
     let d = &acc.data;
     if d.len() < 89 || d[0..8] != VALIDATOR_DISC {
         return None;
     }
     let wallet = Pubkey::new_from_array(d[8..40].try_into().ok()?);
+    // Only the canonical PDA for this wallet is a real ValidatorAccount:
+    // any program-owned account carrying the discriminator at another
+    // address is spoofed or stale and must not enter the reconcile.
+    if derive_validator_account(program_id, &wallet).0 != pda {
+        return None;
+    }
     let stake_amount = u64::from_le_bytes(d[40..48].try_into().ok()?);
     let is_active = d[88] != 0; // offset: disc(8)+pubkey(32)+5*u64/i64(40)+... = byte 88
     Some(ValidatorRow {
@@ -197,7 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rows: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     rows.sort_by_key(|r| r.wallet.to_bytes());
 
@@ -313,7 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refreshed: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     let active_sum: u64 = refreshed
         .iter()
@@ -342,9 +348,85 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  ✓ invariant holds (total_active_stake == Σ active stake).");
     } else {
         println!("  ✗ INVARIANT MISMATCH — do NOT unpause; investigate before any settlement.");
+        // Fail the process: returning Ok(()) here would let an automated
+        // deployment pipeline proceed past a broken reconciliation.
+        return Err(format!(
+            "INVARIANT MISMATCH: registry reports {} active validators totalling {} SOL, \
+             but {} active PDAs sum to {} SOL",
+            reg_active,
+            reg_stake as f64 / 1e9,
+            active_count,
+            active_sum as f64 / 1e9
+        )
+        .into());
     }
     println!(
         "\nReconcile complete. Smoke-test a >=2-independent-co-signer settlement before unpausing."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+
+    /// A minimal well-formed ValidatorAccount blob: discriminator +
+    /// wallet + stake + is_active at byte 88, sized to NEW_LEN.
+    fn validator_account_data(wallet: &Pubkey, stake: u64, is_active: bool) -> Vec<u8> {
+        let mut data = vec![0u8; NEW_LEN];
+        data[0..8].copy_from_slice(&VALIDATOR_DISC);
+        data[8..40].copy_from_slice(wallet.as_ref());
+        data[40..48].copy_from_slice(&stake.to_le_bytes());
+        data[88] = u8::from(is_active);
+        data
+    }
+
+    fn account_with(data: Vec<u8>, owner: Pubkey) -> Account {
+        Account {
+            lamports: 1,
+            data,
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn decode_accepts_the_canonical_pda() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let (pda, _) = derive_validator_account(&program_id, &wallet);
+        let acc = account_with(validator_account_data(&wallet, 42, true), program_id);
+        let row = decode(&program_id, pda, &acc).expect("canonical PDA decodes");
+        assert_eq!(row.wallet, wallet);
+        assert_eq!(row.pda, pda);
+        assert_eq!(row.stake_amount, 42);
+        assert!(row.is_active);
+    }
+
+    #[test]
+    fn decode_rejects_a_non_canonical_pda() {
+        // Same account bytes, but presented at an address that is not
+        // the PDA derived for its wallet: a spoofed/stale account.
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let other_pda = Pubkey::new_unique();
+        let acc = account_with(validator_account_data(&wallet, 42, true), program_id);
+        assert!(
+            decode(&program_id, other_pda, &acc).is_none(),
+            "non-canonical PDA must not enter the reconcile"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_wrong_discriminator() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let (pda, _) = derive_validator_account(&program_id, &wallet);
+        let mut data = validator_account_data(&wallet, 42, true);
+        data[0] ^= 0xFF;
+        let acc = account_with(data, program_id);
+        assert!(decode(&program_id, pda, &acc).is_none());
+    }
 }

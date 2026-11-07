@@ -7,8 +7,9 @@
 //! transcript to the supplied output paths. Tracking issue #64.
 //!
 //! Omit --prior-transcript on the very first contribution; the
-//! binary then seeds a fresh transcript from --circuit and
-//! --initial-srs-hash.
+//! binary then seeds a fresh transcript from --circuit, anchored at
+//! the SHA-512 of --prior-pk (--initial-srs-hash may be supplied to
+//! pin the anchor explicitly, but must match that hash).
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -16,7 +17,8 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use clap::Parser;
 use paraloom::ceremony::{
-    contribute, read_pk, read_transcript, try_hash_from_hex, write_pk, write_transcript, CircuitId,
+    contribute, hash_pk, read_pk, read_transcript, try_hash_from_hex, write_pk, write_transcript,
+    CircuitId,
 };
 use paraloom::types::NodeId;
 use rand::rngs::OsRng;
@@ -51,10 +53,11 @@ struct Args {
 
     /// Hex-encoded SHA-512 of the initial SRS. Only meaningful when
     /// --prior-transcript is omitted; the value is committed to the
-    /// new transcript as the chain anchor. If unset, the chain is
-    /// anchored at the all-zero hash, which is acceptable for
-    /// testnet but should be the actual SHA-512 of the initial PK
-    /// for any production ceremony.
+    /// new transcript as the chain anchor. If unset, the anchor is
+    /// computed from --prior-pk (`hash_pk`); a supplied value that
+    /// does not match the prior key is rejected, since finalize and
+    /// verify would later refuse the transcript with
+    /// `initial_srs_hash mismatch`.
     #[arg(long)]
     initial_srs_hash: Option<String>,
 
@@ -75,12 +78,6 @@ fn main() -> Result<()> {
 
     let circuit =
         CircuitId::from_str(&args.circuit).map_err(|e| anyhow::anyhow!("--circuit: {}", e))?;
-    let initial_srs_hash = match args.initial_srs_hash.as_deref() {
-        Some(hex) => {
-            try_hash_from_hex(hex).map_err(|e| anyhow::anyhow!("--initial-srs-hash: {}", e))?
-        }
-        None => [0u8; 64],
-    };
     let contributor =
         NodeId::from_str(&args.contributor_hex).context("--contributor-hex is not valid hex")?;
 
@@ -88,6 +85,38 @@ fn main() -> Result<()> {
     let prior_transcript = match &args.prior_transcript {
         Some(path) => Some(read_transcript(path)?),
         None => None,
+    };
+
+    // The first contribution anchors the transcript at the SHA-512 of
+    // the initial proving key. Defaulting to the all-zero hash — or
+    // accepting a caller-supplied hash unchecked — produces a
+    // transcript finalize/verify later reject with
+    // `initial_srs_hash mismatch`, so resolve the anchor from the key
+    // itself and refuse a supplied value that disagrees with it. When
+    // a prior transcript exists the anchor is already fixed inside it
+    // and this value is unused.
+    let initial_srs_hash = match args.initial_srs_hash.as_deref() {
+        Some(hex) => {
+            let supplied =
+                try_hash_from_hex(hex).map_err(|e| anyhow::anyhow!("--initial-srs-hash: {}", e))?;
+            if prior_transcript.is_none() {
+                let expected = hash_pk(&prior_pk);
+                if supplied != expected {
+                    return Err(anyhow::anyhow!(
+                        "--initial-srs-hash does not match the SHA-512 of --prior-pk (expected {})",
+                        hex::encode(expected)
+                    ));
+                }
+            }
+            supplied
+        }
+        None => {
+            if prior_transcript.is_none() {
+                hash_pk(&prior_pk)
+            } else {
+                [0u8; 64]
+            }
+        }
     };
 
     let mut rng = OsRng;

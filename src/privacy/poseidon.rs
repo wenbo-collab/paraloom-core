@@ -101,9 +101,15 @@ pub fn poseidon_hash_bytes(data: &[u8]) -> Fr {
     let config = get_poseidon_config();
     let mut sponge = PoseidonSponge::<Fr>::new(config);
 
+    // Bind the input length as the first absorbed element. Without it,
+    // trailing zero bytes are indistinguishable from absent bytes: the
+    // final 31-byte chunk is zero-padded, so `x` and `x || 0x00` — and
+    // `[]` and `[0u8; 31]` — absorb identical field elements and
+    // collide. The length prefix makes every distinct byte-length a
+    // distinct sponge input.
+    let mut field_elements = vec![Fr::from(data.len() as u64)];
     // Convert bytes to field elements
     // Pack bytes into field elements (31 bytes per element for safety)
-    let mut field_elements = Vec::new();
     for chunk in data.chunks(31) {
         let mut bytes = [0u8; 32];
         bytes[..chunk.len()].copy_from_slice(chunk);
@@ -534,6 +540,38 @@ mod tests {
         assert_ne!(
             hash1, hash3,
             "Different inputs should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_poseidon_hash_binds_input_length() {
+        // Trailing zero bytes must change the digest: the final 31-byte
+        // chunk is zero-padded, so without a length binding `x` and
+        // `x || 0x00` — and `[]` and `[0u8; 31]` — collide.
+        assert_ne!(
+            poseidon_hash(b"abc"),
+            poseidon_hash(b"abc\0"),
+            "trailing zero byte must change the digest"
+        );
+        assert_ne!(
+            poseidon_hash(&[]),
+            poseidon_hash(&[0u8; 31]),
+            "empty input must not collide with 31 zero bytes"
+        );
+        assert_ne!(
+            poseidon_hash(&[0u8; 31]),
+            poseidon_hash(&[0u8; 32]),
+            "31 zero bytes must not collide with 32 zero bytes"
+        );
+        assert_ne!(
+            poseidon_hash(&[1u8; 62]),
+            poseidon_hash(&[1u8; 63]),
+            "inputs differing only by a trailing zero byte must not collide"
+        );
+        // Same for the field-element view.
+        assert_ne!(
+            poseidon_hash_bytes(b"abc"),
+            poseidon_hash_bytes(b"abc\0")
         );
     }
 
