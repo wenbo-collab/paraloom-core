@@ -204,7 +204,9 @@ impl EventListener {
     /// unknown (JSON-RPC error -32020). This happens when the persisted cursor
     /// ages out of a provider's signature history: the boundary can never be
     /// satisfied again, so retrying it forever would stall the listener. The
-    /// caller drops the cursor and cold-starts instead.
+    /// caller drops the cursor and walks back a bounded number of pages from
+    /// the tip instead (#1548) — a blind cold start would silently discard the
+    /// deposits that confirmed while the cursor was stale.
     fn is_stale_until_cursor(e: &BridgeError) -> bool {
         matches!(e, BridgeError::SolanaRpc(msg) if msg.contains("-32020"))
     }
@@ -471,17 +473,26 @@ impl EventListener {
         // short page reaches `cursor` (or history runs out), so the gap is never
         // dropped. On a cold start (`cursor == None`) there is no resume point,
         // so take only the newest page and begin scanning from now rather than
-        // replaying the program's entire history.
+        // replaying the program's entire history. A stale cursor is NOT a cold
+        // start: it proves deposits confirmed while the cursor was stale, so
+        // the recovery walk must page back (bounded by `MAX_SIGNATURE_PAGES`)
+        // instead of keeping only the newest page — otherwise every deposit in
+        // the gap is silently dropped and the off-chain tree diverges from the
+        // on-chain tree (#1548).
         let mut signatures = Vec::new();
         let mut before: Option<Signature> = None;
         let mut pages = 0usize;
+        // Set when the stale-cursor self-heal fires this poll: the recovery
+        // walk pages back over the gap instead of cold-starting.
+        let mut recovered_from_stale_cursor = false;
         // The cursor is the `until` boundary. If it ages out of the RPC's
         // queryable history (some providers retain devnet signatures only
         // briefly), the RPC rejects it as a boundary with a "Transaction not
         // found" (-32020) error, and every poll fails forever — the listener
         // stalls and stops indexing deposits. Detect that, drop the stale
-        // cursor, and resume from the latest page (a cold start) so the listener
-        // self-heals. `effective_cursor` may be reset to `None` mid-loop.
+        // cursor, and walk back a bounded number of pages from the tip so the
+        // deposits that confirmed while the cursor was stale are still indexed
+        // (#1548). `effective_cursor` may be reset to `None` mid-loop.
         let mut effective_cursor = cursor;
         loop {
             let batch = match state
@@ -507,14 +518,20 @@ impl EventListener {
             {
                 Ok(batch) => batch,
                 Err(e) if effective_cursor.is_some() && Self::is_stale_until_cursor(&e) => {
-                    log::warn!(
+                    // Loud on purpose (#1548): the stale cursor proves deposits
+                    // may have confirmed while it was unresolvable. Anything
+                    // older than the RPC's retained history is unrecoverable
+                    // from here, so operators must be able to see that a window
+                    // may have been skipped and backfill it by other means.
+                    log::error!(
                         target: "paraloom::bridge::solana",
-                        "deposit listener cursor {} is no longer resolvable by the RPC ({}); resetting it and resuming from the latest signatures",
+                        "deposit listener cursor {} is no longer resolvable by the RPC ({}); clearing it and entering a bounded backfill from the latest signatures — deposits confirmed while the cursor was stale may have been skipped if they predate the RPC's retained history",
                         effective_cursor.expect("guarded by effective_cursor.is_some()"),
                         e
                     );
                     Self::clear_cursor(state).await;
                     effective_cursor = None;
+                    recovered_from_stale_cursor = true;
                     before = None;
                     pages = 0;
                     signatures.clear();
@@ -540,7 +557,10 @@ impl EventListener {
                 break;
             }
             // Cold start: take only the newest page, do not walk all history.
-            if effective_cursor.is_none() {
+            // A stale-cursor recovery is not a cold start (see #1548): the
+            // cursor proves deposits may exist in older pages, so keep walking
+            // back until a short page or the MAX_SIGNATURE_PAGES cap.
+            if effective_cursor.is_none() && !recovered_from_stale_cursor {
                 break;
             }
             if pages >= MAX_SIGNATURE_PAGES {
@@ -918,6 +938,120 @@ mod tests {
             *state.last_signature.read().await,
             None,
             "the stale cursor must be cleared so a restart does not reload it"
+        );
+    }
+
+    /// Regression test for #1548: the stale-cursor self-heal must NOT silently
+    /// discard the deposits that confirmed while the cursor was stale. The
+    /// gap deposit sits in an older page, which the old cold-start branch
+    /// never asked for. The recovery walk must page back past the newest page
+    /// (bounded by `MAX_SIGNATURE_PAGES`) so the gap deposit is indexed.
+    #[tokio::test]
+    async fn stale_cursor_self_heal_backfills_the_gap_deposits() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let stale = Signature::new_unique();
+        let newest = Signature::new_unique();
+        let second = Signature::new_unique();
+        let gap = Signature::new_unique(); // a deposit confirmed while the cursor was stale
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+
+        {
+            let mut pages = mock.get_signatures_pages.lock().unwrap();
+            // 1) the `until = stale` boundary is rejected by the RPC (-32020)
+            pages.push_back(Err(BridgeError::SolanaRpc(format!(
+                "getSignaturesForAddress: RPC response error -32020: Transaction {stale} not found"
+            ))));
+            // 2) the cold-start retry (`until = None`) returns the NEWEST page,
+            //    which is full (batch_limit = 2), so the recovery must walk back.
+            pages.push_back(Ok(vec![
+                RpcConfirmedTransactionStatusWithSignature {
+                    signature: newest.to_string(),
+                    slot: 9,
+                    err: None,
+                    memo: None,
+                    block_time: None,
+                    confirmation_status: None,
+                },
+                RpcConfirmedTransactionStatusWithSignature {
+                    signature: second.to_string(),
+                    slot: 8,
+                    err: None,
+                    memo: None,
+                    block_time: None,
+                    confirmation_status: None,
+                },
+            ]));
+            // 3) the older page holds the gap deposit; a short page ends the walk.
+            pages.push_back(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: gap.to_string(),
+                slot: 7,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        }
+        {
+            let mut txs = mock.get_transactions.lock().unwrap();
+            txs.insert(
+                newest,
+                synth_deposit_tx(
+                    newest,
+                    9,
+                    &program_id,
+                    &depositor,
+                    2_000,
+                    [7u8; 32],
+                    [13u8; 32],
+                ),
+            );
+            txs.insert(
+                second,
+                synth_deposit_tx(
+                    second,
+                    8,
+                    &program_id,
+                    &depositor,
+                    3_000,
+                    [9u8; 32],
+                    [15u8; 32],
+                ),
+            );
+            txs.insert(
+                gap,
+                synth_deposit_tx(
+                    gap,
+                    7,
+                    &program_id,
+                    &depositor,
+                    4_000,
+                    [11u8; 32],
+                    [17u8; 32],
+                ),
+            );
+        }
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+        state.batch_limit = 2; // two signatures per page
+        *state.last_signature.write().await = Some(stale);
+
+        let events = EventListener::fetch_events(&state, Some(stale))
+            .await
+            .expect("a stale cursor must self-heal, not propagate the error");
+
+        assert_eq!(
+            events.len(),
+            3,
+            "the recovery walk must index the newest page AND the older gap page"
+        );
+        assert!(
+            events.iter().any(|e| e.amount == 4_000),
+            "the deposit in the gap must be fetched, not silently lost"
         );
     }
 
