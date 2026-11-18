@@ -119,6 +119,16 @@ struct SubmitResponse {
     request_id: String,
 }
 
+/// Maximum transact proof wire length (#1620): 1-byte suite tag + the
+/// 128-byte Groth16Bn254TransactV3 body (`GROTH16_BN254_COMPRESSED_LEN`).
+/// `split_tagged_proof` enforces this exact length downstream, so anything
+/// longer can never verify — it would only burn gossip bandwidth and a full
+/// BFT round before being rejected. `MAX_PROOF_BYTES` (256, in
+/// `bridge::solana::cosign_message`) is the looser on-chain settlement bound;
+/// the ingress enforces the exact wire length.
+pub const MAX_TRANSACT_PROOF_WIRE_LEN: usize =
+    1 + crate::privacy::proof_codec::GROTH16_BN254_COMPRESSED_LEN;
+
 /// Parse a 32-byte field from hex, tolerating a `0x` prefix; 400 on any
 /// malformed input.
 fn parse_hex32(label: &str, s: &str) -> Result<[u8; 32], (StatusCode, String)> {
@@ -185,6 +195,19 @@ async fn submit_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             "proof must not be empty".to_string(),
+        ));
+    }
+    // Reject oversized proofs at the door (#1620): no size bound used to be
+    // enforced here, so a ~1 MB proof was accepted, gossiped to every
+    // validator, hashed into `canonical_id`, and started a full BFT round
+    // before `split_tagged_proof` rejected it downstream. A 400 here costs
+    // nothing; the old path cost a consensus round per request.
+    if proof.len() > MAX_TRANSACT_PROOF_WIRE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "proof exceeds maximum wire length ({MAX_TRANSACT_PROOF_WIRE_LEN} bytes)"
+            ),
         ));
     }
 
@@ -364,7 +387,7 @@ mod tests {
             "44".repeat(32),
             "55".repeat(32),
             ext_amount,
-            "01".repeat(192),
+            "01".repeat(MAX_TRANSACT_PROOF_WIRE_LEN),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
         )
@@ -372,6 +395,23 @@ mod tests {
 
     fn well_formed_body() -> String {
         body_with_ext_amount(0)
+    }
+
+    /// Same shape as [`well_formed_body`], but with a proof of `n_bytes`
+    /// `0x01` bytes (hex-encoded), to probe the ingress size bound.
+    fn body_with_proof_len(n_bytes: usize) -> String {
+        format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(n_bytes),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        )
     }
 
     #[tokio::test]
@@ -398,7 +438,61 @@ mod tests {
         assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);
         assert_eq!(seen.root, [0x55u8; 32]);
         assert_eq!(seen.ext_amount, 0);
-        assert_eq!(seen.proof, vec![0x01u8; 192]);
+        assert_eq!(seen.proof, vec![0x01u8; MAX_TRANSACT_PROOF_WIRE_LEN]);
+    }
+
+    /// Boundary: a proof at exactly the maximum wire length (1-byte tag +
+    /// 128-byte body, #1620) is accepted.
+    #[tokio::test]
+    async fn proof_at_max_wire_length_is_accepted() {
+        let stub = Arc::new(CaptureStub {
+            seen: tokio::sync::Mutex::new(None),
+        });
+        let app = router(stub.clone(), None);
+        let resp = app
+            .oneshot(post_json(&body_with_proof_len(
+                MAX_TRANSACT_PROOF_WIRE_LEN,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(stub.seen.lock().await.is_some(), "request forwarded");
+    }
+
+    /// Regression (#1620): a proof one byte over the wire length is rejected
+    /// at the door with 400 and never reaches consensus — no gossip, no
+    /// `canonical_id` hash, no BFT round.
+    #[tokio::test]
+    async fn oversized_proof_is_400_and_never_forwarded() {
+        let stub = Arc::new(CaptureStub {
+            seen: tokio::sync::Mutex::new(None),
+        });
+        let app = router(stub.clone(), None);
+        let resp = app
+            .oneshot(post_json(&body_with_proof_len(
+                MAX_TRANSACT_PROOF_WIRE_LEN + 1,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(stub.seen.lock().await.is_none(), "must not reach consensus");
+    }
+
+    /// Regression (#1620): the issue's reproduction size — a 1,000,000-byte
+    /// proof — is rejected at the door instead of starting a verification
+    /// round on every validator.
+    #[tokio::test]
+    async fn megabyte_proof_is_400() {
+        let stub = Arc::new(CaptureStub {
+            seen: tokio::sync::Mutex::new(None),
+        });
+        let app = router(stub.clone(), None);
+        let resp = app
+            .oneshot(post_json(&body_with_proof_len(1_000_000)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(stub.seen.lock().await.is_none(), "must not reach consensus");
     }
 
     #[tokio::test]
@@ -433,7 +527,7 @@ mod tests {
             "33".repeat(32),
             "44".repeat(32),
             "55".repeat(32),
-            "01".repeat(192),
+            "01".repeat(MAX_TRANSACT_PROOF_WIRE_LEN),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
         );
