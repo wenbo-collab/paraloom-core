@@ -1488,7 +1488,9 @@ pub mod paraloom_program {
     /// never a theft). Completeness cannot be enforced on-chain (the program
     /// cannot enumerate all PDAs), so it is the upgrade authority's
     /// responsibility; reconcile any active-but-excluded PDA with
-    /// [`deactivate_validator`] before relying on the rebuilt denominator.
+    /// [`reconcile_orphaned_validator`] — NOT [`deactivate_validator`], whose
+    /// counter decrements would double-subtract stake the reset already
+    /// excluded (#1625) — before relying on the rebuilt denominator.
     pub fn reset_validator_registry(
         ctx: Context<ResetValidatorRegistry>,
         stake_mint: Pubkey,
@@ -1625,11 +1627,13 @@ pub mod paraloom_program {
     /// Deactivate a single validator so it can no longer be counted toward the
     /// settlement quorum, keeping the registry invariant
     /// `total_active_stake == Σ active-PDA stake` intact. Admin-only (the
-    /// registry authority). This reconciles validators dropped from the active
-    /// set — e.g. `is_active` PDAs left behind by an earlier
-    /// `reset_validator_registry` that rebuilt the counters but did not
-    /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
+    /// registry authority). Only for validators still counted in the registry
+    /// counters: do NOT call this on a validator already excluded from the
+    /// counters by an earlier `reset_validator_registry` — its stake was
+    /// already subtracted by the rebuild, so the decrements below would
+    /// double-subtract and corrupt the denominator (#1625). For those
+    /// orphaned PDAs use [`reconcile_orphaned_validator`] instead.
+    /// It does not move the staked lamports; those
     /// are returned through `unregister_validator`.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
@@ -1652,6 +1656,33 @@ pub mod paraloom_program {
             registry.active_validators = registry.active_validators.saturating_sub(1);
         }
         msg!("Validator deactivated: {}", who);
+        Ok(())
+    }
+
+    /// Reconcile a validator PDA left `is_active` by an earlier
+    /// `reset_validator_registry` that rebuilt the counters without it
+    /// (#1625). The excluded validator's stake and count were ALREADY removed
+    /// from `total_active_stake` / `active_validators` by the reset, so
+    /// calling [`deactivate_validator`] here would double-subtract and corrupt
+    /// the quorum denominator (settlement then bricks with `QuorumNotMet`).
+    /// This instruction clears the orphaned PDA's active state and routes its
+    /// stake into unbonding — reclaimable via `withdraw_unbonded_stake` after
+    /// the delay, same as a deactivation — WITHOUT mutating the registry
+    /// counters. Admin-only (the registry authority), same accounts as
+    /// [`deactivate_validator`]; reverts on an already-inactive PDA.
+    pub fn reconcile_orphaned_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
+        let v = &mut ctx.accounts.validator_account;
+        require!(v.is_active, BridgeError::ValidatorNotActive);
+        let stake = v.stake_amount;
+        let who = v.validator;
+        let now_slot = Clock::get()?.slot;
+        v.is_active = false;
+        v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+        v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+        v.stake_amount = 0;
+        // Do NOT decrement validator_registry counters: they were already
+        // rebuilt by reset_validator_registry without this validator (#1625).
+        msg!("Orphaned validator reconciled: {}", who);
         Ok(())
     }
 
